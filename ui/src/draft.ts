@@ -529,21 +529,45 @@ export function applicationCaptureChoices(applications: readonly ApplicationInfo
   const pathKey = (application: ApplicationInfo) =>
     (application.executablePath ?? application.executable).toLowerCase();
   const audioPaths = new Set(eligible.filter((application) => application.audioSessionCount > 0).map(pathKey));
-  // Capture includes the selected process tree, so one entry per executable
-  // path is enough: the earliest-created instance is normally the tree root.
-  const earliest = new Map<string, ApplicationInfo>();
+  // Prefer the process with active/observed audio sessions (e.g. a game's
+  // audio process rather than its earlier idle launcher process), falling back
+  // to earliest creation time.
+  const preferred = new Map<string, ApplicationInfo>();
   for (const application of eligible) {
     const key = pathKey(application);
-    const current = earliest.get(key);
+    const current = preferred.get(key);
+    if (!current) {
+      preferred.set(key, application);
+      continue;
+    }
+    const activeDiff = application.activeAudioSessionCount - current.activeAudioSessionCount;
+    if (activeDiff !== 0) {
+      if (activeDiff > 0) preferred.set(key, application);
+      continue;
+    }
+    const sessionDiff = application.audioSessionCount - current.audioSessionCount;
+    if (sessionDiff !== 0) {
+      if (sessionDiff > 0) preferred.set(key, application);
+      continue;
+    }
     const created = application.creationTime100ns === null ? null : BigInt(application.creationTime100ns);
-    const currentCreated = current?.creationTime100ns == null ? null : BigInt(current.creationTime100ns);
-    if (!current || (created !== null && (currentCreated === null || created < currentCreated)))
-      earliest.set(key, application);
+    const currentCreated = current.creationTime100ns === null ? null : BigInt(current.creationTime100ns);
+    if (created !== null && (currentCreated === null || created < currentCreated)) preferred.set(key, application);
   }
-  const roots = [...earliest.values()].sort(byLabel);
+  const isWindowsSystem = (application: ApplicationInfo) => {
+    const p = (application.executablePath ?? "").toLowerCase();
+    return (
+      p.includes("\\windows\\system32\\") ||
+      p.includes("\\windows\\syswow64\\") ||
+      p.includes("\\windows\\systemapps\\")
+    );
+  };
+  const byUserFirst = (left: ApplicationInfo, right: ApplicationInfo) =>
+    Number(isWindowsSystem(left)) - Number(isWindowsSystem(right)) || byLabel(left, right);
+  const roots = [...preferred.values()].sort(byLabel);
   return {
     withAudio: roots.filter((application) => audioPaths.has(pathKey(application))),
-    other: roots.filter((application) => !audioPaths.has(pathKey(application))),
+    other: roots.filter((application) => !audioPaths.has(pathKey(application))).sort(byUserFirst),
   };
 }
 

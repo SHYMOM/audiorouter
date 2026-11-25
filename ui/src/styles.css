@@ -789,6 +789,18 @@ button:disabled {
   gap: 0.5rem;
   overflow-wrap: anywhere;
 }
+.app-exe-icon {
+  width: 16px;
+  height: 16px;
+  object-fit: contain;
+  flex-shrink: 0;
+}
+.app-choice-with-icon {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
+  min-width: 0;
+}
 .application-group-options .app-group-member-row {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;

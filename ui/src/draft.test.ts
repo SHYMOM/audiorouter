@@ -594,11 +594,11 @@ describe("application capture identity", () => {
     expect(choices.other).toEqual([discordRoot]);
   });
 
-  it("shows one entry for an application whose helper processes use audio", () => {
+  it("prefers the audio-active process when folding same-path processes", () => {
     const root = app(36808, "Discord.exe", "C:\\Discord\\app-1.0.9259\\Discord.exe", "100");
     const voice = app(51156, "Discord.exe", "C:\\Discord\\app-1.0.9259\\Discord.exe", "105", 1);
     const media = app(53964, "Discord.exe", "C:\\Discord\\app-1.0.9259\\Discord.exe", "104", 2);
-    expect(applicationCaptureChoices([voice, media, root])).toEqual({ withAudio: [root], other: [] });
+    expect(applicationCaptureChoices([voice, media, root])).toEqual({ withAudio: [media], other: [] });
   });
 
   it("identifies a route whose only enabled source is one bound application", () => {

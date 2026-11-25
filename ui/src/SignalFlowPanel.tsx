@@ -5,7 +5,8 @@ import type { DiagnosticsSnapshot, Node, PluginScanEntry, Session } from "@audio
 import type { ApplicationRow, UiBackend } from "./backend";
 import { applicationCaptureChoices, applicationChoiceKey } from "./draft";
 import { LoadedPluginsPanel, PluginScanPanel } from "./PluginPanels";
-import { ApplicationChoiceOptions, applicationChoiceLabel } from "./NodeEditors";
+import { ApplicationChoiceOptions, applicationChoiceLabel, duplicateApplicationLabels } from "./NodeEditors";
+import { AppExeIcon, useApplicationIcons } from "./appIcons";
 
 export function SignalFlowPanel({
   flowCanvas,
@@ -88,7 +89,14 @@ export function SignalFlowPanel({
   const tr = useMessages();
   const [applicationMode, setApplicationMode] = useState<"single" | "group">("single");
   const [groupApplicationKeys, setGroupApplicationKeys] = useState<string[]>([]);
+  const [groupSearchQuery, setGroupSearchQuery] = useState("");
   const [groupExecutablePaths, setGroupExecutablePaths] = useState<string[]>([]);
+  const pickerChoices = applicationCaptureChoices(applications);
+  const pickerCapturable = [...pickerChoices.withAudio, ...pickerChoices.other];
+  const pickerIcons = useApplicationIcons([
+    ...pickerCapturable.map((application) => application.executablePath),
+    ...groupExecutablePaths,
+  ]);
   const [executablePath, setExecutablePath] = useState("");
   const [pickerMessage, setPickerMessage] = useState("");
   /** The typed path was refused: the field says so (aria-invalid) and the status says why. */
@@ -441,40 +449,73 @@ export function SignalFlowPanel({
                             </div>
                           </>
                         )
-                      : (capturable.length > 0 || groupExecutablePaths.length > 0) && (
-                          <fieldset className="application-group-options" disabled={!backend.connected}>
-                            <legend>{tr("signalFlowDialogs.groupLegend")}</legend>
-                            {capturable.map((application) => {
-                              const key = applicationKey(application);
-                              return (
-                                <label key={key} className="checkbox-row">
+                      : (capturable.length > 0 || groupExecutablePaths.length > 0) &&
+                        (() => {
+                          const duplicates = duplicateApplicationLabels(capturable);
+                          const query = groupSearchQuery.trim().toLowerCase();
+                          const filtered = query
+                            ? capturable.filter((application) => {
+                                const label = applicationChoiceLabel(application, duplicates).toLowerCase();
+                                return label.includes(query) || application.executable.toLowerCase().includes(query);
+                              })
+                            : capturable;
+                          return (
+                            <>
+                              {capturable.length > 0 && (
+                                <label>
+                                  Search running applications
                                   <input
-                                    type="checkbox"
-                                    checked={groupApplicationKeys.includes(key)}
-                                    onChange={(event) =>
-                                      setGroupApplicationKeys((keys) =>
-                                        event.target.checked ? [...keys, key] : keys.filter((item) => item !== key),
-                                      )
-                                    }
+                                    type="search"
+                                    value={groupSearchQuery}
+                                    placeholder="Filter by app name (e.g. BloodStrike, Discord)..."
+                                    onChange={(event) => setGroupSearchQuery(event.target.value)}
                                   />
-                                  <span>{applicationChoiceLabel(application)}</span>
                                 </label>
-                              );
-                            })}
-                            {groupExecutablePaths.map((path) => (
-                              <label key={path.toLocaleLowerCase()} className="checkbox-row">
-                                <input
-                                  type="checkbox"
-                                  checked
-                                  onChange={() =>
-                                    setGroupExecutablePaths((paths) => paths.filter((item) => item !== path))
-                                  }
-                                />
-                                <span>{path}</span>
-                              </label>
-                            ))}
-                          </fieldset>
-                        )}
+                              )}
+                              <fieldset className="application-group-options" disabled={!backend.connected}>
+                                <legend>{tr("signalFlowDialogs.groupLegend")}</legend>
+                                {filtered.map((application) => {
+                                  const key = applicationKey(application);
+                                  return (
+                                    <label key={key} className="checkbox-row">
+                                      <input
+                                        type="checkbox"
+                                        checked={groupApplicationKeys.includes(key)}
+                                        onChange={(event) =>
+                                          setGroupApplicationKeys((keys) =>
+                                            event.target.checked ? [...keys, key] : keys.filter((item) => item !== key),
+                                          )
+                                        }
+                                      />
+                                      <span
+                                        className="app-choice-with-icon"
+                                        title={application.executablePath ?? application.executable}
+                                      >
+                                        <AppExeIcon executablePath={application.executablePath} icons={pickerIcons} />
+                                        <span>{applicationChoiceLabel(application, duplicates)}</span>
+                                      </span>
+                                    </label>
+                                  );
+                                })}
+                                {groupExecutablePaths.map((path) => (
+                                  <label key={path.toLocaleLowerCase()} className="checkbox-row">
+                                    <input
+                                      type="checkbox"
+                                      checked
+                                      onChange={() =>
+                                        setGroupExecutablePaths((paths) => paths.filter((item) => item !== path))
+                                      }
+                                    />
+                                    <span className="app-choice-with-icon" title={path}>
+                                      <AppExeIcon executablePath={path} icons={pickerIcons} />
+                                      <span>{path}</span>
+                                    </span>
+                                  </label>
+                                ))}
+                              </fieldset>
+                            </>
+                          );
+                        })()}
                   </>
                 )}
                 {applicationMode === "group" && (

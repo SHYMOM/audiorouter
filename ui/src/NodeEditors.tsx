@@ -28,6 +28,7 @@ import { useHiddenDevices, visibleDevices } from "./hiddenDevices";
 import type { VirtualCableStatus } from "@audiorouter/contracts";
 import { cableEndpointName, cableUnavailableReason } from "./virtualCableStatus";
 import { useMessages } from "./i18n/useMessages";
+import { AppExeIcon, useApplicationIcons } from "./appIcons";
 import { tx } from "./i18n";
 import type { MessageKey } from "./i18n/generated/messageKeys";
 
@@ -696,20 +697,44 @@ export function MixerInputsEditor({
   );
 }
 
-export function applicationChoiceLabel(application: ApplicationRow): string {
-  return `${application.audioDisplayNames[0] ?? application.executable} - PID ${application.processId}`;
+export function applicationBaseLabel(application: ApplicationRow): string {
+  const display = application.audioDisplayNames.find((name) => name.trim() && !name.trim().startsWith("{"));
+  if (display) return display.trim();
+  return application.executable.replace(/\.exe$/i, "");
+}
+
+export function duplicateApplicationLabels(applications: readonly ApplicationRow[]): Set<string> {
+  const counts = new Map<string, number>();
+  for (const application of applications) {
+    const key = applicationBaseLabel(application).toLowerCase();
+    counts.set(key, (counts.get(key) ?? 0) + 1);
+  }
+  const duplicates = new Set<string>();
+  for (const [key, count] of counts) {
+    if (count > 1) duplicates.add(key);
+  }
+  return duplicates;
+}
+
+export function applicationChoiceLabel(application: ApplicationRow, duplicates?: ReadonlySet<string>): string {
+  const name = applicationBaseLabel(application);
+  if (duplicates?.has(name.toLowerCase())) {
+    return `${name} (PID ${application.processId})`;
+  }
+  return name;
 }
 
 export function ApplicationChoiceOptions({ applications }: { applications: ApplicationRow[] }) {
   const tr = useMessages();
   const { withAudio, other } = applicationCaptureChoices(applications);
+  const duplicates = duplicateApplicationLabels([...withAudio, ...other]);
   return (
     <>
       {withAudio.length > 0 && (
         <optgroup label={tr("g5.appUsingAudio")}>
           {withAudio.map((application) => (
             <option key={applicationChoiceKey(application)} value={applicationChoiceKey(application)}>
-              {applicationChoiceLabel(application)}
+              {applicationChoiceLabel(application, duplicates)}
             </option>
           ))}
         </optgroup>
@@ -718,7 +743,7 @@ export function ApplicationChoiceOptions({ applications }: { applications: Appli
         <optgroup label={tr("g5.appOther")}>
           {other.map((application) => (
             <option key={applicationChoiceKey(application)} value={applicationChoiceKey(application)}>
-              {applicationChoiceLabel(application)}
+              {applicationChoiceLabel(application, duplicates)}
             </option>
           ))}
         </optgroup>
@@ -807,6 +832,7 @@ export function ApplicationGroupEditor({
   const choices = applicationCaptureChoices(applications);
   const capturable = [...choices.withAudio, ...choices.other];
   const [selectedKeys, setSelectedKeys] = useState<string[]>([]);
+  const [searchQuery, setSearchQuery] = useState("");
   const [executablePath, setExecutablePath] = useState("");
   const [editorMessage, setEditorMessage] = useState("");
 
@@ -816,6 +842,18 @@ export function ApplicationGroupEditor({
     const key = (application.executablePath ?? application.executable).toLowerCase();
     return !existingKeys.has(key);
   });
+  const duplicates = duplicateApplicationLabels(availableToAdd);
+  const query = searchQuery.trim().toLowerCase();
+  const filteredToAdd = query
+    ? availableToAdd.filter((application) => {
+        const label = applicationChoiceLabel(application, duplicates).toLowerCase();
+        return label.includes(query) || application.executable.toLowerCase().includes(query);
+      })
+    : availableToAdd;
+  const icons = useApplicationIcons([
+    ...entries.map((entry) => entry.executablePath),
+    ...availableToAdd.map((application) => application.executablePath),
+  ]);
 
   const addSelectedRunning = () => {
     const chosen = availableToAdd.filter((application) => selectedKeys.includes(applicationChoiceKey(application)));
@@ -873,7 +911,10 @@ export function ApplicationGroupEditor({
       <div className="application-group-options" role="list">
         {entries.map((entry) => (
           <div key={entryKey(entry)} className="app-group-member-row" role="listitem">
-            <span title={entry.executablePath ?? entry.executable}>{entry.executable}</span>
+            <span className="app-choice-with-icon" title={entry.executablePath ?? entry.executable}>
+              <AppExeIcon executablePath={entry.executablePath} icons={icons} />
+              <span>{entry.executable.replace(/\.exe$/i, "")}</span>
+            </span>
             <button
               type="button"
               className="secondary"
@@ -888,9 +929,19 @@ export function ApplicationGroupEditor({
       </div>
       {availableToAdd.length > 0 && (
         <>
+          <label>
+            Search running applications
+            <input
+              type="search"
+              value={searchQuery}
+              placeholder="Filter by app name (e.g. BloodStrike, Discord)..."
+              disabled={disabled}
+              onChange={(event) => setSearchQuery(event.target.value)}
+            />
+          </label>
           <fieldset className="application-group-options" disabled={disabled}>
             <legend>Add running applications</legend>
-            {availableToAdd.map((application) => {
+            {filteredToAdd.map((application) => {
               const key = applicationChoiceKey(application);
               return (
                 <label key={key} className="checkbox-row">
@@ -903,7 +954,10 @@ export function ApplicationGroupEditor({
                       )
                     }
                   />
-                  <span>{applicationChoiceLabel(application)}</span>
+                  <span className="app-choice-with-icon" title={application.executablePath ?? application.executable}>
+                    <AppExeIcon executablePath={application.executablePath} icons={icons} />
+                    <span>{applicationChoiceLabel(application, duplicates)}</span>
+                  </span>
                 </label>
               );
             })}

@@ -1417,6 +1417,178 @@ async fn choose_application_executable(
     }
 }
 
+#[cfg(windows)]
+fn encode_base64_bytes(input: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
+    for chunk in input.chunks(3) {
+        let b0 = u32::from(chunk[0]);
+        let b1 = chunk.get(1).copied().map_or(0, u32::from);
+        let b2 = chunk.get(2).copied().map_or(0, u32::from);
+        let triple = (b0 << 16) | (b1 << 8) | b2;
+        out.push(TABLE[((triple >> 18) & 0x3f) as usize] as char);
+        out.push(TABLE[((triple >> 12) & 0x3f) as usize] as char);
+        out.push(if chunk.len() > 1 {
+            TABLE[((triple >> 6) & 0x3f) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            TABLE[(triple & 0x3f) as usize] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
+#[cfg(windows)]
+fn extract_exe_icon_data_url(path: &str) -> Option<String> {
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt;
+    use windows::core::PCWSTR;
+    use windows::Win32::Graphics::Gdi::{
+        CreateCompatibleDC, DeleteDC, DeleteObject, GetDIBits, BITMAPINFO, BITMAPINFOHEADER,
+        BI_RGB, DIB_RGB_COLORS,
+    };
+    use windows::Win32::UI::Shell::{SHGetFileInfoW, SHFILEINFOW, SHGFI_ICON, SHGFI_SMALLICON};
+    use windows::Win32::UI::WindowsAndMessaging::{DestroyIcon, GetIconInfo, ICONINFO};
+
+    const SIZE: i32 = 16;
+    let wide: Vec<u16> = OsStr::new(path).encode_wide().chain(Some(0)).collect();
+    let mut shfi = SHFILEINFOW::default();
+    // SAFETY: `wide` is null-terminated and lives for the call; `shfi` is zero-initialized.
+    let ok = unsafe {
+        SHGetFileInfoW(
+            PCWSTR(wide.as_ptr()),
+            windows::Win32::Storage::FileSystem::FILE_FLAGS_AND_ATTRIBUTES(0),
+            Some(&mut shfi),
+            std::mem::size_of::<SHFILEINFOW>() as u32,
+            SHGFI_ICON | SHGFI_SMALLICON,
+        )
+    };
+    if ok == 0 || shfi.hIcon.is_invalid() {
+        return None;
+    }
+    let hicon = shfi.hIcon;
+    let mut icon_info = ICONINFO::default();
+    // SAFETY: `hicon` is a valid icon handle owned by us and destroyed before returning.
+    let got_info = unsafe { GetIconInfo(hicon, &mut icon_info) }.is_ok();
+    if !got_info {
+        // SAFETY: `hicon` was returned by SHGetFileInfoW above.
+        unsafe {
+            let _ = DestroyIcon(hicon);
+        }
+        return None;
+    }
+
+    let mut pixels = vec![0u8; (SIZE * SIZE * 4) as usize];
+    let mut bmi = BITMAPINFO {
+        bmiHeader: BITMAPINFOHEADER {
+            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+            biWidth: SIZE,
+            biHeight: -SIZE,
+            biPlanes: 1,
+            biBitCount: 32,
+            biCompression: BI_RGB.0,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    // SAFETY: `hdc` is a fresh memory DC deleted below; `hbmColor` is valid from `GetIconInfo`.
+    let scanlines = unsafe {
+        let hdc = CreateCompatibleDC(None);
+        let lines = if !hdc.is_invalid() && !icon_info.hbmColor.is_invalid() {
+            GetDIBits(
+                hdc,
+                icon_info.hbmColor,
+                0,
+                SIZE as u32,
+                Some(pixels.as_mut_ptr().cast()),
+                &mut bmi,
+                DIB_RGB_COLORS,
+            )
+        } else {
+            0
+        };
+        if !hdc.is_invalid() {
+            let _ = DeleteDC(hdc);
+        }
+        if !icon_info.hbmColor.is_invalid() {
+            let _ = DeleteObject(icon_info.hbmColor.into());
+        }
+        if !icon_info.hbmMask.is_invalid() {
+            let _ = DeleteObject(icon_info.hbmMask.into());
+        }
+        let _ = DestroyIcon(hicon);
+        lines
+    };
+
+    if scanlines != SIZE {
+        return None;
+    }
+
+    // Build a 32-bit BGRA BMP in memory (14-byte file header + 40-byte DIB header + pixels).
+    let file_size = 54u32 + pixels.len() as u32;
+    let mut bmp = Vec::with_capacity(file_size as usize);
+    bmp.extend_from_slice(b"BM");
+    bmp.extend_from_slice(&file_size.to_le_bytes());
+    bmp.extend_from_slice(&0u32.to_le_bytes());
+    bmp.extend_from_slice(&54u32.to_le_bytes());
+    bmp.extend_from_slice(&40u32.to_le_bytes());
+    bmp.extend_from_slice(&SIZE.to_le_bytes());
+    bmp.extend_from_slice(&(-SIZE).to_le_bytes());
+    bmp.extend_from_slice(&1u16.to_le_bytes());
+    bmp.extend_from_slice(&32u16.to_le_bytes());
+    bmp.extend_from_slice(&0u32.to_le_bytes());
+    bmp.extend_from_slice(&(pixels.len() as u32).to_le_bytes());
+    bmp.extend_from_slice(&[0u8; 16]);
+    bmp.extend_from_slice(&pixels);
+    Some(format!(
+        "data:image/bmp;base64,{}",
+        encode_base64_bytes(&bmp)
+    ))
+}
+
+/// Extract and cache small 16x16 `.exe` icons as `data:image/bmp;base64,...` URLs.
+#[tauri::command]
+async fn get_application_icons(paths: Vec<String>) -> std::collections::HashMap<String, String> {
+    #[cfg(windows)]
+    {
+        static ICON_CACHE: std::sync::OnceLock<
+            std::sync::Mutex<std::collections::HashMap<String, Option<String>>>,
+        > = std::sync::OnceLock::new();
+        let cache = ICON_CACHE.get_or_init(|| std::sync::Mutex::new(Default::default()));
+        let mut out = std::collections::HashMap::new();
+        for path in paths.into_iter().take(256) {
+            let key = path.to_ascii_lowercase();
+            let cached = cache.lock().ok().and_then(|guard| guard.get(&key).cloned());
+            let icon = match cached {
+                Some(entry) => entry,
+                None => {
+                    let extracted = extract_exe_icon_data_url(&path);
+                    if let Ok(mut guard) = cache.lock() {
+                        if guard.len() < 512 {
+                            guard.insert(key, extracted.clone());
+                        }
+                    }
+                    extracted
+                }
+            };
+            if let Some(url) = icon {
+                out.insert(path, url);
+            }
+        }
+        out
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = paths;
+        std::collections::HashMap::new()
+    }
+}
+
 fn write_probe_marker(path: &std::path::Path, contents: &[u8]) -> Result<(), String> {
     let parent = path
         .parent()
@@ -2787,6 +2959,7 @@ fn main() {
             open_plugin_editor,
             choose_session_file,
             choose_application_executable,
+            get_application_icons,
             session_id,
             mcp_activity_list,
             backend_diagnostics_list,
