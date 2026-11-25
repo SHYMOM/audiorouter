@@ -47,6 +47,7 @@ import { InstrumentNodeEditor } from "./InstrumentNodeEditor";
 import { PluginEditorControls, PluginNodeInspector, PluginRecoveryControls } from "./PluginPanels";
 import {
   ApplicationCaptureBinding,
+  ApplicationGroupEditor,
   CableBinding,
   DenoiseLearnEditor,
   FirFilterEditor,
@@ -58,7 +59,12 @@ import {
 } from "./NodeEditors";
 import { AudioFileNodeEditor } from "./AudioFileNodeEditor";
 import { SoundboardNodeEditor } from "./SoundboardNodeEditor";
-import { removeNodeDraftParameters, setVirtualBusDraftCable, unfedRouteNodes } from "./draft";
+import {
+  removeNodeDraftParameters,
+  setVirtualBusDraftCable,
+  unfedRouteNodes,
+  type ApplicationGroupEntry,
+} from "./draft";
 import { useVirtualCableStatus } from "./virtualCableStatus";
 import type { NodeDeviceUsers } from "./appUsage";
 
@@ -86,6 +92,7 @@ export function PropertiesPanel({
   refreshApplications,
   deviceUsers,
   rebindApplicationCapture,
+  updateApplicationGroup,
   setRenderEndpointId,
   captureEndpointId,
   recorderStatuses,
@@ -134,6 +141,7 @@ export function PropertiesPanel({
   /** Apps on each device node's device (D1); null while checking, absent offline. */
   deviceUsers?: Map<string, NodeDeviceUsers> | null;
   rebindApplicationCapture: (nodeId: string, application: ApplicationRow) => void;
+  updateApplicationGroup?: (nodeId: string, entries: ApplicationGroupEntry[]) => void;
   setRenderEndpointId: Dispatch<SetStateAction<string>>;
   captureEndpointId: string;
   recorderStatuses: RecorderStatus[];
@@ -553,6 +561,16 @@ export function PropertiesPanel({
             disabled={!backend.connected || sessionRunning}
             onRefresh={refreshApplications}
             onSelect={(application) => rebindApplicationCapture(selectedNode.id, application)}
+          />
+        )}
+        {selectedNode.kind === "applicationGroup" && updateApplicationGroup && (
+          <ApplicationGroupEditor
+            node={selectedNode}
+            applications={applications}
+            error={applicationsError}
+            disabled={!backend.connected || sessionRunning}
+            onRefresh={refreshApplications}
+            onChange={(entries) => updateApplicationGroup(selectedNode.id, entries)}
           />
         )}
         {selectedNode.kind === "physicalOutput" && (

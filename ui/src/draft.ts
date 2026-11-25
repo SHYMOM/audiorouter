@@ -566,6 +566,7 @@ function routeSourceType(kind: NodeKind): "generated" | "native" | "physical" | 
     case "physicalInput":
       return "physical";
     case "applicationCapture":
+    case "applicationGroup":
       return "application";
     case "physicalOutput":
     case "virtualCaptureSink":
@@ -623,6 +624,7 @@ export function rendersOwnAudio(kind: NodeKind): boolean {
       return true;
     case "physicalInput":
     case "applicationCapture":
+    case "applicationGroup":
     case "endpointLoopback":
     case "physicalOutput":
     case "virtualRenderSource":
@@ -706,6 +708,7 @@ function isChainProcessor(kind: NodeKind): boolean {
       return true;
     case "physicalInput":
     case "applicationCapture":
+    case "applicationGroup":
     case "endpointLoopback":
     case "physicalOutput":
     case "virtualRenderSource":
@@ -1030,39 +1033,118 @@ export function appendApplicationCapturePathNode(session: Session, path: string)
   );
 }
 
-/** Expand a chosen app set into independent sources feeding one ordinary Mixer. */
+export interface ApplicationGroupEntry {
+  executable: string;
+  executablePath?: string;
+}
+
+/** Reads the grouped applications stored on an `applicationGroup` node. */
+export function applicationGroupEntries(node: Node): ApplicationGroupEntry[] {
+  const raw = node.parameters.applications;
+  if (!Array.isArray(raw)) return [];
+  const entries: ApplicationGroupEntry[] = [];
+  for (const item of raw) {
+    if (!item || typeof item !== "object" || Array.isArray(item)) continue;
+    const record = item as Record<string, unknown>;
+    if (typeof record.executable !== "string" || !record.executable) continue;
+    const entry: ApplicationGroupEntry = { executable: record.executable };
+    if (typeof record.executablePath === "string" && record.executablePath) {
+      entry.executablePath = record.executablePath;
+    }
+    entries.push(entry);
+  }
+  return entries;
+}
+
+/** Expand a chosen app set into one single `applicationGroup` source node. */
 export function appendApplicationCaptureGroup(
   session: Session,
   applications: readonly ApplicationInfo[],
   executablePaths: readonly string[],
-): { session: Session; mixerId: string } {
-  const selectors = new Map<string, { parameters: Record<string, boolean | number | string>; label: string }>();
+): { session: Session; groupId: string } {
+  const entries = new Map<string, ApplicationGroupEntry>();
   for (const application of applications) {
     if (!application.executablePath)
       throw userError("draftErrors.exePathUnavailable", { name: application.executable });
     const selector = applicationExecutableSelector(application.executablePath);
-    const parameters = applicationSelectorParameters(selector);
     const key = selector.executablePath.toLowerCase();
-    if (!selectors.has(key)) selectors.set(key, { parameters, label: `${application.executable} capture` });
+    if (!entries.has(key)) {
+      entries.set(key, {
+        executable: selector.executable,
+        executablePath: selector.executablePath,
+      });
+    }
   }
   for (const path of executablePaths) {
     const selector = applicationExecutableSelector(path);
-    const parameters = applicationSelectorParameters(selector);
     const key = selector.executablePath.toLowerCase();
-    if (!selectors.has(key)) selectors.set(key, { parameters, label: `${selector.executable} capture` });
+    if (!entries.has(key)) {
+      entries.set(key, {
+        executable: selector.executable,
+        executablePath: selector.executablePath,
+      });
+    }
   }
-  if (selectors.size < 2) throw userError("draftErrors.groupNeedsTwo");
+  if (entries.size < 2) throw userError("draftErrors.groupNeedsTwo");
 
-  let next = session;
-  const sourceIds: string[] = [];
-  for (const selector of selectors.values()) {
-    next = appendApplicationCaptureSelectorNode(next, selector.parameters, selector.label);
-    sourceIds.push(next.nodes.at(-1)!.id);
+  let suffix = 1;
+  let id = `application-group-${suffix}`;
+  while (session.nodes.some((node) => node.id === id)) {
+    suffix += 1;
+    id = `application-group-${suffix}`;
   }
-  next = appendLibraryNode(next, "mixer");
-  const mixer = next.nodes.at(-1)!;
-  for (const sourceId of sourceIds) next = appendDraftConnection(next, sourceId, "out", mixer.id, "in");
-  return { session: next, mixerId: mixer.id };
+  const list = [...entries.values()];
+  return {
+    session: {
+      ...session,
+      nodes: [
+        ...session.nodes,
+        {
+          id,
+          kind: "applicationGroup",
+          typeVersion: 1,
+          name: `App group ${suffix}`,
+          enabled: true,
+          bypass: false,
+          parameters: { applications: list as unknown as Session["nodes"][number]["parameters"][string] },
+          ports: [{ name: "out", direction: "output", channels: 2 }],
+        },
+      ],
+    },
+    groupId: id,
+  };
+}
+
+/** Updates the list of applications on an existing `applicationGroup` node. */
+export function setApplicationGroupApplications(
+  session: Session,
+  nodeId: string,
+  entries: readonly ApplicationGroupEntry[],
+): Session {
+  const nodeIndex = session.nodes.findIndex((node) => node.id === nodeId);
+  if (nodeIndex < 0) throw new Error("Application group node was not found");
+  const node = session.nodes[nodeIndex]!;
+  if (node.kind !== "applicationGroup") throw new Error("Only an application group node can edit grouped apps");
+  const deduped = new Map<string, ApplicationGroupEntry>();
+  for (const entry of entries) {
+    const executable = entry.executable.trim();
+    if (!executable) continue;
+    const executablePath = entry.executablePath?.trim();
+    const key = (executablePath || executable).toLowerCase();
+    if (!deduped.has(key)) {
+      deduped.set(key, executablePath ? { executable, executablePath } : { executable });
+    }
+  }
+  if (deduped.size < 1) throw new Error("An application group needs at least one application");
+  const nodes = [...session.nodes];
+  nodes[nodeIndex] = {
+    ...node,
+    parameters: {
+      ...node.parameters,
+      applications: [...deduped.values()] as unknown as Session["nodes"][number]["parameters"][string],
+    },
+  };
+  return { ...session, nodes };
 }
 
 /** Adds a stopped endpoint-loopback source bound to one exact render endpoint. */

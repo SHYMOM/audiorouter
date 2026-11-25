@@ -28,6 +28,7 @@ const TOOL_GUIDES: Record<string, string> = {
   physicalInput: "physical-input",
   physicalOutput: "physical-output",
   applicationCapture: "application-capture",
+  applicationGroup: "application-capture",
   endpointLoopback: "endpoint-loopback",
   virtualRenderSource: "virtual-render-source",
   virtualCaptureSink: "virtual-capture-sink",

@@ -23,6 +23,8 @@ pub enum NativeMultiInputSourceBinding<'a> {
     Generated,
     /// A Network Receive node: its validated sender/port/buffer parameters.
     Network(&'a audiorouter_domain::Node),
+    /// An Application Group node: captures and sums all grouped apps into one stereo source.
+    ApplicationGroup(&'a audiorouter_domain::Node),
 }
 
 /// Why a capture endpoint cannot feed an Input Device node whose output port
@@ -384,12 +386,7 @@ impl ControlPlane {
             &plugin_stages.stages,
             &media,
         )
-        .map_err(|error| match error {
-            audiorouter_engine::GraphCompileError::UnsupportedPath(path) => ControlError::InvalidRequest(format!(
-                "{path} is not supported: a path needs one source or one Mixer, then a single chain, then its outputs"
-            )),
-            error => ControlError::InvalidRequest(format!("multi-input graph rejected: {error:?}")),
-        })?;
+        .map_err(|error| ControlError::InvalidRequest(error.describe()))?;
         let source_node_ids = compiled.input_node_ids().to_vec();
         let bindings = match bindings {
             MultiInputBindings::Ordered(list) => {
@@ -531,6 +528,21 @@ impl ControlPlane {
                     if !matches_identity || channels != 2 {
                         return Err(ControlError::InvalidRequest(
                             "application capture binding does not match the enabled node's identity".into(),
+                        ));
+                    }
+                }
+                (
+                    NodeKind::ApplicationGroup,
+                    NativeMultiInputSourceBinding::ApplicationGroup(bound_node),
+                ) => {
+                    let has_apps = node
+                        .parameters
+                        .get("applications")
+                        .and_then(Value::as_array)
+                        .is_some_and(|items| !items.is_empty());
+                    if bound_node.id != node.id || channels != 2 || !has_apps {
+                        return Err(ControlError::InvalidRequest(
+                            "application group binding requires at least one application".into(),
                         ));
                     }
                 }
@@ -701,6 +713,74 @@ impl ControlPlane {
                     });
                     capture_clients.push(capture);
                 }
+                NativeMultiInputSourceBinding::ApplicationGroup(group_node) => {
+                    let apps = group_node
+                        .parameters
+                        .get("applications")
+                        .and_then(Value::as_array)
+                        .ok_or_else(|| {
+                            ControlError::InvalidRequest(format!(
+                                "Add at least one application to {} in its Properties.",
+                                group_node.name
+                            ))
+                        })?;
+                    let running = audiorouter_windows_audio::enumerate_applications()
+                        .map_err(audio_control_error)?;
+                    let mut members = Vec::with_capacity(apps.len());
+                    for entry in apps {
+                        let Some(executable) = entry.get("executable").and_then(Value::as_str)
+                        else {
+                            continue;
+                        };
+                        let executable_path = entry.get("executablePath").and_then(Value::as_str);
+                        match audiorouter_windows_audio::resolve_application_group_roots(
+                            &running,
+                            executable,
+                            executable_path,
+                        ) {
+                            Ok(matched_roots) => {
+                                for application in matched_roots {
+                                    let capture =
+                                        audiorouter_windows_audio::ProcessLoopbackCapture::open(
+                                            application.process_id,
+                                            audiorouter_windows_audio::ProcessLoopbackMode::IncludeTargetTree,
+                                        )
+                                        .map_err(audio_control_error)?;
+                                    members.push(
+                                        audiorouter_windows_audio::MultiInputCaptureSource::ApplicationLoopback(
+                                            capture,
+                                        ),
+                                    );
+                                }
+                            }
+                            Err(
+                                audiorouter_windows_audio::AudioError::ApplicationRestartNotFound {
+                                    ..
+                                },
+                            ) => {
+                                members.push(
+                                    audiorouter_windows_audio::MultiInputCaptureSource::Silence(
+                                        audiorouter_windows_audio::SilentCapture::new(
+                                            audiorouter_engine::PROCESSING_QUANTUM_FRAMES,
+                                        ),
+                                    ),
+                                );
+                            }
+                            Err(error) => return Err(audio_control_error(error)),
+                        }
+                    }
+                    if members.is_empty() {
+                        return Err(ControlError::InvalidRequest(format!(
+                            "Add at least one application to {} in its Properties.",
+                            group_node.name
+                        )));
+                    }
+                    capture_clients.push(
+                        audiorouter_windows_audio::MultiInputCaptureSource::ApplicationGroup(
+                            audiorouter_windows_audio::ApplicationGroupCapture::new(members),
+                        ),
+                    );
+                }
             }
         }
         let feeder = audiorouter_windows_audio::WasapiMultiInputFanout::new(
@@ -737,6 +817,7 @@ impl ControlPlane {
                 NativeMultiInputSourceBinding::Generated => json!({ "kind": "generated" }),
                 NativeMultiInputSourceBinding::Network(node) => json!({ "kind": "network", "nodeId": node.id }),
                 NativeMultiInputSourceBinding::Application { process_id, expected_executable, .. } => json!({ "kind": "application", "processId": process_id, "executable": expected_executable }),
+                NativeMultiInputSourceBinding::ApplicationGroup(node) => json!({ "kind": "applicationGroup", "nodeId": node.id }),
             }).collect::<Vec<_>>(),
             "sourceNodeIds": source_node_ids,
             "branchNodeIds": self

@@ -9,6 +9,7 @@ import { isRouteSource, rendersOwnAudio, supportsApplicationMixerRoute } from ".
 const ALL_KINDS: Record<NodeKind, true> = {
   physicalInput: true,
   applicationCapture: true,
+  applicationGroup: true,
   endpointLoopback: true,
   physicalOutput: true,
   virtualRenderSource: true,
@@ -75,6 +76,7 @@ describe("source kind classification (UI-1)", () => {
     expect(KINDS.filter(isRouteSource).sort()).toEqual(
       [
         "applicationCapture",
+        "applicationGroup",
         "audioFile",
         "endpointLoopback",
         "instrument",
@@ -89,7 +91,7 @@ describe("source kind classification (UI-1)", () => {
 
   it("limits the application Mixer route to devices, applications and generated sound", () => {
     expect(KINDS.filter(supportsApplicationMixerRoute).sort()).toEqual(
-      ["applicationCapture", "audioFile", "physicalInput", "soundboard", "testSignal"].sort(),
+      ["applicationCapture", "applicationGroup", "audioFile", "physicalInput", "soundboard", "testSignal"].sort(),
     );
   });
 });

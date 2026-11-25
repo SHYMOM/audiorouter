@@ -7,6 +7,7 @@ export type EntityId = string;
 export type NodeKind =
   | "physicalInput"
   | "applicationCapture"
+  | "applicationGroup"
   | "endpointLoopback"
   | "physicalOutput"
   | "virtualRenderSource"

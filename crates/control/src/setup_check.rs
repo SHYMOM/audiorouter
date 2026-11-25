@@ -89,6 +89,7 @@ fn device_use(kind: NodeKind) -> Option<DeviceUse> {
         NodeKind::PhysicalOutput => Some(DeviceUse::Output),
         NodeKind::EndpointLoopback => Some(DeviceUse::Loopback),
         NodeKind::ApplicationCapture
+        | NodeKind::ApplicationGroup
         | NodeKind::VirtualRenderSource
         | NodeKind::VirtualCaptureSink
         | NodeKind::TestSignal

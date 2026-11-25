@@ -336,9 +336,7 @@ impl ControlPlane {
                 &plugin_stages.stages,
                 &media,
             )
-            .map_err(|error| {
-                ControlError::InvalidRequest(format!("multi-input graph rejected: {error:?}"))
-            })?;
+            .map_err(|error| ControlError::InvalidRequest(error.describe()))?;
             if let Some(handles) =
                 self.reusable_source_transports(&session, source_retention(live, previous))
             {

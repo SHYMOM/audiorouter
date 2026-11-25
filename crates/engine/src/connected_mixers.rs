@@ -78,6 +78,7 @@ pub(super) fn compile(
                 source.kind,
                 NodeKind::PhysicalInput
                     | NodeKind::ApplicationCapture
+                    | NodeKind::ApplicationGroup
                     | NodeKind::EndpointLoopback
                     | NodeKind::VirtualRenderSource
                     | NodeKind::NetworkReceive

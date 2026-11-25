@@ -38,6 +38,7 @@ fn role(kind: NodeKind) -> Role {
     match kind {
         NodeKind::PhysicalInput
         | NodeKind::ApplicationCapture
+        | NodeKind::ApplicationGroup
         | NodeKind::EndpointLoopback
         | NodeKind::VirtualRenderSource
         | NodeKind::TestSignal
@@ -100,6 +101,9 @@ fn source_node(id: &str, kind: NodeKind) -> Node {
         NodeKind::NetworkReceive => json!({ "sender": "192.168.1.20", "port": 48000 }),
         NodeKind::ApplicationCapture => {
             json!({ "executable": "game.exe", "processPolicy": "allVerifiedInstances" })
+        }
+        NodeKind::ApplicationGroup => {
+            json!({ "applications": [{ "executable": "game.exe", "executablePath": "C:\\Games\\game.exe" }] })
         }
         _ => json!({}),
     };
@@ -249,6 +253,7 @@ fn renders_own_audio(kind: NodeKind) -> bool {
         | NodeKind::Instrument => true,
         NodeKind::PhysicalInput
         | NodeKind::ApplicationCapture
+        | NodeKind::ApplicationGroup
         | NodeKind::EndpointLoopback
         | NodeKind::VirtualRenderSource
         | NodeKind::NetworkReceive => false,

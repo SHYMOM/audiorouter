@@ -77,6 +77,7 @@ pub(crate) fn node_template(kind: NodeKind) -> Option<(&'static str, Vec<Port>, 
         NodeKind::Plugin
         | NodeKind::Instrument
         | NodeKind::ApplicationCapture
+        | NodeKind::ApplicationGroup
         | NodeKind::EndpointLoopback
         | NodeKind::VirtualRenderSource
         | NodeKind::VirtualCaptureSink => None,

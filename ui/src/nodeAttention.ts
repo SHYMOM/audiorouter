@@ -4,6 +4,7 @@ import type { Node } from "@audiorouter/contracts";
 export const PRIVACY_MUTED_KINDS: readonly string[] = [
   "physicalInput",
   "applicationCapture",
+  "applicationGroup",
   "endpointLoopback",
   "virtualRenderSource",
 ];

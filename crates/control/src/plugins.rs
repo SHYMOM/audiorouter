@@ -1065,6 +1065,7 @@ fn records_from_a_device(kind: NodeKind) -> bool {
         // Other computers, apps, playback and generated audio are not a
         // recording device on this PC.
         NodeKind::ApplicationCapture
+        | NodeKind::ApplicationGroup
         | NodeKind::EndpointLoopback
         | NodeKind::VirtualRenderSource
         | NodeKind::NetworkReceive

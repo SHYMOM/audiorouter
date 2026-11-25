@@ -5,6 +5,7 @@ import {
   appendApplicationCaptureGroup,
   appendApplicationCaptureNode,
   appendApplicationCapturePathNode,
+  setApplicationGroupApplications,
   applicationCaptureChoices,
   applicationOnlyRouteSource,
   independentPaths,
@@ -749,21 +750,32 @@ describe("appendApplicationCaptureNode", () => {
       audioEndpoints: [],
     };
     const result = appendApplicationCaptureGroup(demoSession, [running], ["c:\\apps\\CHAT.exe", "D:\\Games\\game.exe"]);
-    const sources = result.session.nodes.filter((node) => node.kind === "applicationCapture");
-    const mixer = result.session.nodes.find((node) => node.id === result.mixerId)!;
-    expect(sources).toHaveLength(2);
-    expect(sources[0].parameters.processPolicy).toBe("allVerifiedInstances");
-    expect(sources[0].parameters).not.toHaveProperty("processId");
-    expect(sources[1].parameters).toEqual({
-      executable: "game.exe",
-      executablePath: "D:\\Games\\game.exe",
-      processPolicy: "allVerifiedInstances",
+    const group = result.session.nodes.find((node) => node.id === result.groupId)!;
+    expect(group.kind).toBe("applicationGroup");
+    expect(result.session.nodes.filter((node) => node.kind === "applicationCapture")).toHaveLength(0);
+    expect(result.session.nodes.filter((node) => node.kind === "mixer")).toHaveLength(
+      demoSession.nodes.filter((node) => node.kind === "mixer").length,
+    );
+    expect(group.parameters).toEqual({
+      applications: [
+        { executable: "chat.exe", executablePath: "C:\\Apps\\chat.exe" },
+        { executable: "game.exe", executablePath: "D:\\Games\\game.exe" },
+      ],
     });
-    expect(
-      result.session.edges.filter((edge) => edge.destinationNode === mixer.id && edge.destinationPort === "in"),
-    ).toHaveLength(2);
-    expect(result.session.edges).toHaveLength(demoSession.edges.length + 2);
-    for (const edge of demoSession.edges) expect(result.session.edges).toContainEqual(edge);
+    expect(result.session.edges).toHaveLength(demoSession.edges.length);
+
+    const edited = setApplicationGroupApplications(result.session, result.groupId, [
+      { executable: "chat.exe", executablePath: "C:\\Apps\\chat.exe" },
+      { executable: "music.exe", executablePath: "C:\\Apps\\music.exe" },
+      { executable: "voice.exe", executablePath: "C:\\Apps\\voice.exe" },
+    ]);
+    expect(edited.nodes.find((node) => node.id === result.groupId)!.parameters).toEqual({
+      applications: [
+        { executable: "chat.exe", executablePath: "C:\\Apps\\chat.exe" },
+        { executable: "music.exe", executablePath: "C:\\Apps\\music.exe" },
+        { executable: "voice.exe", executablePath: "C:\\Apps\\voice.exe" },
+      ],
+    });
   });
 
   it("rejects a group with fewer than two unique app selectors atomically", () => {

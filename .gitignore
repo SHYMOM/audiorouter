@@ -26,3 +26,6 @@
 
 # Vite dependency cache of the site preview.
 /site/.vite/
+
+graphify-out/
+node_modules/

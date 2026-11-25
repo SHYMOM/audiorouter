@@ -83,6 +83,8 @@ import {
   mixedApplicationRouteOtherSources,
   mixerRouteSources,
   rebindApplicationCaptureNode,
+  setApplicationGroupApplications,
+  type ApplicationGroupEntry,
   appendDraftConnection,
   appendEndpointLoopbackNode,
   appendEqPresetNode,
@@ -3224,21 +3226,31 @@ function AppContent({ backend = defaultBackend }: { backend?: UiBackend } = {}) 
       return message;
     }
   };
-  const addApplicationGroupFromPicker = (chosen: ApplicationRow[], executablePaths: string[]): boolean => {
+  /** Returns why the group was refused, so the picker can display it; null when added. */
+  const addApplicationGroupFromPicker = (chosen: ApplicationRow[], executablePaths: string[]): string | null => {
     try {
       const current = draftRef.current;
-      const { session: next, mixerId } = appendApplicationCaptureGroup(current, chosen, executablePaths);
-      const addedCount =
-        next.nodes.filter((node) => node.kind === "applicationCapture").length -
-        current.nodes.filter((node) => node.kind === "applicationCapture").length;
+      const { session: next, groupId } = appendApplicationCaptureGroup(current, chosen, executablePaths);
+      const groupNode = next.nodes.find((node) => node.id === groupId);
+      const addedCount = Array.isArray(groupNode?.parameters.applications)
+        ? groupNode.parameters.applications.length
+        : 0;
       recordDraftChange(next);
-      setSelectedNodeId(mixerId);
+      setSelectedNodeId(groupId);
       setActionMessage(say("g1.appAppGroupAdded", { count: addedCount }));
       closeApplicationPicker();
-      return true;
+      return null;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : tm("g1.appAppGroupFail");
+      setActionMessage(errorMessage(message));
+      return message;
+    }
+  };
+  const updateApplicationGroup = (nodeId: string, entries: ApplicationGroupEntry[]) => {
+    try {
+      recordDraftChange(setApplicationGroupApplications(draftRef.current, nodeId, entries));
     } catch (error) {
       setActionMessage(errorMessage(error instanceof Error ? error.message : tm("g1.appAppGroupFail")));
-      return false;
     }
   };
   const rebindApplicationCapture = (nodeId: string, application: ApplicationRow) => {
@@ -4413,6 +4425,7 @@ function AppContent({ backend = defaultBackend }: { backend?: UiBackend } = {}) 
                       refreshApplications={refreshApplications}
                       deviceUsers={backend.connected ? deviceUsers : undefined}
                       rebindApplicationCapture={rebindApplicationCapture}
+                      updateApplicationGroup={updateApplicationGroup}
                       setRenderEndpointId={setRenderEndpointId}
                       captureEndpointId={captureEndpointId}
                       recorderStatuses={recorderStatuses}

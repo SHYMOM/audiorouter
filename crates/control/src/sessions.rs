@@ -109,6 +109,7 @@ pub(crate) fn node_kind_opens_audio_device(kind: NodeKind) -> bool {
     match kind {
         NodeKind::PhysicalInput
         | NodeKind::ApplicationCapture
+        | NodeKind::ApplicationGroup
         | NodeKind::EndpointLoopback
         | NodeKind::PhysicalOutput
         | NodeKind::VirtualRenderSource

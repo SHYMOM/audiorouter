@@ -1095,7 +1095,7 @@ pub struct PluginWorkerHealth {
 /// Maximum number of independent realtime observers supported by one
 /// processing boundary. Recorder nodes use one observer each; the bound
 /// keeps fan-out work explicit and matches the global recorder limit.
-pub const MAX_AUDIO_TAPS: usize = 8;
+pub const MAX_AUDIO_TAPS: usize = 32;
 pub const MAX_RECORDER_NODE_ID_BYTES: usize = 256;
 
 /// Prebuilt observer set for a realtime graph boundary. Construction and
@@ -5722,6 +5722,44 @@ pub enum GraphCompileError {
     MissingAudioMedia(String),
 }
 
+impl GraphCompileError {
+    /// Human-readable explanation of why the graph could not be compiled.
+    pub fn describe(&self) -> String {
+        match self {
+            Self::InvalidGraph(errors) => {
+                if errors.is_empty() {
+                    "the graph has invalid nodes or connections".into()
+                } else {
+                    errors
+                        .iter()
+                        .take(3)
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                }
+            }
+            Self::UnsupportedTopology => {
+                "this route layout is not supported: connect each enabled source through a single chain or Mixer to an enabled output, with no dead-end branches".into()
+            }
+            Self::UnsupportedPath(reason) => {
+                if reason.starts_with("path ") {
+                    format!(
+                        "{reason} is not supported: a path needs one source or Mixer, a single chain, and its outputs"
+                    )
+                } else {
+                    reason.clone()
+                }
+            }
+            Self::InvalidSampleRate => {
+                "unsupported sample rate: the audio engine requires 48 kHz".into()
+            }
+            Self::MissingAudioMedia(id) => {
+                format!("audio file media '{id}' is missing; choose or re-upload the file")
+            }
+        }
+    }
+}
+
 /// Domain validation plus the engine's processing width. Cable nodes may
 /// declare up to 8 channels for a direct multichannel cable route, which the
 /// cable worker carries without the engine (WP-09 slice 5); the engine itself
@@ -7162,6 +7200,7 @@ pub fn compile_session_at_sample_rate_with_plugins_and_audio(
             }
             NodeKind::PhysicalInput
             | NodeKind::ApplicationCapture
+            | NodeKind::ApplicationGroup
             | NodeKind::EndpointLoopback
             | NodeKind::VirtualRenderSource
             | NodeKind::NetworkReceive
@@ -8470,7 +8509,9 @@ pub fn compile_native_paths_with_plugins_and_audio(
     let session = session.as_ref();
     let components = independent_path_sessions(session);
     if components.is_empty() {
-        return Err(GraphCompileError::UnsupportedTopology);
+        return Err(GraphCompileError::UnsupportedPath(
+            "no enabled audio source is connected to an enabled output in this session".into(),
+        ));
     }
     let mut paths = Vec::with_capacity(components.len());
     for (index, component) in components.iter().enumerate() {
@@ -8550,7 +8591,9 @@ pub fn compile_native_paths_with_plugins_and_audio(
         .map(CompiledMixerFanoutGraph::branch_count)
         .sum::<usize>();
     if input_count > MAX_AUDIO_TAPS || output_count > MAX_AUDIO_TAPS {
-        return Err(GraphCompileError::UnsupportedTopology);
+        return Err(GraphCompileError::UnsupportedPath(format!(
+            "this route has {input_count} active inputs and {output_count} active outputs (maximum {MAX_AUDIO_TAPS} each); combine apps into an App group or disable unused sources or outputs"
+        )));
     }
     let is_physical = |id: &audiorouter_domain::EntityId| {
         session
@@ -8805,6 +8848,7 @@ pub fn renders_own_audio(kind: audiorouter_domain::NodeKind) -> bool {
         | NodeKind::Instrument => true,
         NodeKind::PhysicalInput
         | NodeKind::ApplicationCapture
+        | NodeKind::ApplicationGroup
         | NodeKind::EndpointLoopback
         | NodeKind::PhysicalOutput
         | NodeKind::VirtualRenderSource
@@ -8852,6 +8896,7 @@ pub fn hosts_plugin_worker(kind: audiorouter_domain::NodeKind) -> bool {
         NodeKind::Plugin | NodeKind::Instrument => true,
         NodeKind::PhysicalInput
         | NodeKind::ApplicationCapture
+        | NodeKind::ApplicationGroup
         | NodeKind::EndpointLoopback
         | NodeKind::PhysicalOutput
         | NodeKind::VirtualRenderSource
@@ -8897,6 +8942,7 @@ fn disabled_node_mutes(kind: audiorouter_domain::NodeKind) -> bool {
     match kind {
         NodeKind::PhysicalInput
         | NodeKind::ApplicationCapture
+        | NodeKind::ApplicationGroup
         | NodeKind::EndpointLoopback
         | NodeKind::PhysicalOutput
         | NodeKind::VirtualRenderSource
@@ -8965,6 +9011,7 @@ fn is_chain_processor(kind: audiorouter_domain::NodeKind) -> bool {
         | NodeKind::Duck => true,
         NodeKind::PhysicalInput
         | NodeKind::ApplicationCapture
+        | NodeKind::ApplicationGroup
         | NodeKind::EndpointLoopback
         | NodeKind::PhysicalOutput
         | NodeKind::VirtualRenderSource

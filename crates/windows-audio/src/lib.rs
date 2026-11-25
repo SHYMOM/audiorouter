@@ -278,7 +278,7 @@ pub struct NativeBridgeDriverInfo {
     pub capabilities: u32,
     pub supported_rates: u32,
     /// Configured minimum / default shared-mode period, frames at 48 kHz
-    /// (registry `MinPeriodFrames` / `DefaultPeriodFrames`, 17 §5.5).
+    /// (registry `MinPeriodFrames` / `DefaultPeriodFrames`, 17 Â§5.5).
     pub min_period_frames: u32,
     pub default_period_frames: u32,
 }
@@ -393,7 +393,7 @@ struct NativeBridgeOpenRequest {
     bus_id: [u16; 64],
 }
 
-/// `AR_BRIDGE_OPEN_EXTENSION`: negotiates float64 samples (17 §5.2).
+/// `AR_BRIDGE_OPEN_EXTENSION`: negotiates float64 samples (17 Â§5.2).
 #[cfg(windows)]
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
@@ -1425,7 +1425,7 @@ impl NativeBridgeController {
             return Err(NativeBridgeControllerError::Windows(error));
         }
         // The driver owns the lease from here; its HEARTBEAT result is the
-        // only liveness decision (a stalled owner may renew, spec 17 §5).
+        // only liveness decision (a stalled owner may renew, spec 17 Â§5).
         let mut session = session;
         session.defer_lease_to_driver();
         Ok(Self {
@@ -1529,12 +1529,12 @@ impl NativeBridgeController {
             .map_err(NativeBridgeControllerError::Session)
     }
 
-    /// Driver-written stream counters for this lease (17 §5.2).
+    /// Driver-written stream counters for this lease (17 Â§5.2).
     pub fn counters(&self) -> NativeBridgeStreamCounters {
         self.live().counters()
     }
 
-    /// Driver-written `SetWritePacket` outcomes for this lease (17 §5.2).
+    /// Driver-written `SetWritePacket` outcomes for this lease (17 Â§5.2).
     pub fn packet_counters(&self) -> NativeBridgePacketCounters {
         self.live().packet_counters()
     }
@@ -4458,7 +4458,7 @@ impl windows::Win32::Media::Audio::IActivateAudioInterfaceCompletionHandler_Impl
 /// channel layout and sample format, so a shared-mode stream initialized with
 /// `AUTOCONVERTPCM | SRC_DEFAULT_QUALITY` is resampled by the Windows audio
 /// engine. Returns whether the rate changed (and so needs the SRC flag).
-/// `None`, an unchanged rate, or a rate outside 8–192 kHz leaves the format as is.
+/// `None`, an unchanged rate, or a rate outside 8â€“192 kHz leaves the format as is.
 ///
 /// # Safety
 /// `format` must point to a valid, writable `WAVEFORMATEX` (or the header of a
@@ -4672,7 +4672,7 @@ impl ProcessLoopbackCapture {
                     error,
                 })?;
         // The process-loopback virtual device does not expose a reliable
-        // endpoint mix format. Microsoft’s activation sample uses this
+        // endpoint mix format. Microsoftâ€™s activation sample uses this
         // caller-owned PCM shape and lets shared mode convert it.
         // The feeder consumes graph-rate frames directly. A 44.1 kHz
         // request here starves a 48 kHz Mixer even with silent app audio.
@@ -7253,6 +7253,201 @@ pub enum MultiInputCaptureSource {
     Silence(SilentCapture),
     /// Audio streamed from another computer by a Network Send node.
     Network(crate::NetworkReceiver),
+    /// Several application-loopback (or silent) captures summed into one stereo source.
+    ApplicationGroup(ApplicationGroupCapture),
+}
+
+struct ApplicationGroupScratch {
+    raw: Vec<u8>,
+    mix: Vec<f32>,
+    member_buffers: Vec<Vec<f32>>,
+    member_lengths: Vec<usize>,
+}
+
+/// Sums several application process-loopback captures into one stereo float32
+/// source without allocating on the audio thread.
+pub struct ApplicationGroupCapture {
+    members: Vec<MultiInputCaptureSource>,
+    scratch: std::cell::RefCell<ApplicationGroupScratch>,
+}
+
+impl ApplicationGroupCapture {
+    pub fn new(members: Vec<MultiInputCaptureSource>) -> Self {
+        let max_samples = MAX_FLOAT32_ACCUMULATOR_FRAMES * 2;
+        let member_count = members.len();
+        Self {
+            members,
+            scratch: std::cell::RefCell::new(ApplicationGroupScratch {
+                raw: vec![0; max_samples * std::mem::size_of::<f32>()],
+                mix: vec![0.0; max_samples],
+                member_buffers: (0..member_count).map(|_| vec![0.0; max_samples]).collect(),
+                member_lengths: vec![0; member_count],
+            }),
+        }
+    }
+
+    pub fn start(&mut self) -> Result<(), AudioError> {
+        self.scratch.get_mut().member_lengths.fill(0);
+        for index in 0..self.members.len() {
+            if let Err(error) = self.members[index].start() {
+                for rollback in (0..index).rev() {
+                    let _ = self.members[rollback].stop();
+                }
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
+    pub fn stop(&mut self) -> Result<(), AudioError> {
+        let mut first_error = None;
+        for member in self.members.iter_mut().rev() {
+            if let Err(error) = member.stop() {
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+            }
+        }
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+}
+
+impl AudioCaptureSource for ApplicationGroupCapture {
+    fn next_packet_into(
+        &self,
+        destination: &mut [u8],
+        bytes_per_frame: usize,
+    ) -> Result<Option<(CapturePacket, usize)>, AudioError> {
+        const STEREO_BYTES: usize = 2 * std::mem::size_of::<f32>();
+        const SILENT_FLAG: u32 = windows::Win32::Media::Audio::AUDCLNT_BUFFERFLAGS_SILENT.0 as u32;
+        if bytes_per_frame != STEREO_BYTES {
+            return Err(AudioError::InvalidFrameSize);
+        }
+        let max_frames = (destination.len() / STEREO_BYTES).min(MAX_FLOAT32_ACCUMULATOR_FRAMES);
+        if max_frames == 0 || self.members.is_empty() {
+            return Ok(None);
+        }
+        let mut scratch = self
+            .scratch
+            .try_borrow_mut()
+            .map_err(|_| AudioError::ProcessingStateUnavailable)?;
+        let ApplicationGroupScratch {
+            raw,
+            mix,
+            member_buffers,
+            member_lengths,
+        } = &mut *scratch;
+        let max_samples = max_frames * 2;
+        let mut any_non_silent = false;
+        let mut any_silent_packet = false;
+        let mut silent_flags = 0u32;
+
+        for (index, member) in self.members.iter().enumerate() {
+            let is_silence = matches!(member, MultiInputCaptureSource::Silence(_));
+            if is_silence {
+                if !any_silent_packet && member_lengths[index] == 0 {
+                    if let Some((packet, _)) = member.next_packet_into(raw, bytes_per_frame)? {
+                        any_silent_packet = true;
+                        silent_flags |= packet.flags;
+                    }
+                }
+                continue;
+            }
+            any_non_silent = true;
+            while member_lengths[index] < max_samples {
+                let Some((packet, written)) = member.next_packet_into(raw, bytes_per_frame)? else {
+                    break;
+                };
+                if packet.frames == 0 || written == 0 {
+                    break;
+                }
+                let sample_count =
+                    (packet.frames as usize * 2).min(written / std::mem::size_of::<f32>());
+                let buf = &mut member_buffers[index];
+                let available_cap = buf.len().saturating_sub(member_lengths[index]);
+                let copy_samples = sample_count.min(available_cap);
+                let is_silent_packet = (packet.flags & SILENT_FLAG) != 0;
+                if is_silent_packet {
+                    buf[member_lengths[index]..member_lengths[index] + copy_samples].fill(0.0);
+                } else {
+                    for (offset, chunk) in raw[..copy_samples * std::mem::size_of::<f32>()]
+                        .chunks_exact(std::mem::size_of::<f32>())
+                        .enumerate()
+                    {
+                        let sample = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+                        buf[member_lengths[index] + offset] =
+                            if sample.is_finite() { sample } else { 0.0 };
+                    }
+                }
+                member_lengths[index] += copy_samples;
+            }
+        }
+
+        let output_samples = member_lengths
+            .iter()
+            .copied()
+            .max()
+            .unwrap_or(0)
+            .min(max_samples);
+        let output_frames = output_samples / 2;
+        if output_frames == 0 {
+            if !any_non_silent && any_silent_packet {
+                let silent_frames = audiorouter_engine::PROCESSING_QUANTUM_FRAMES.min(max_frames);
+                let byte_count = silent_frames * STEREO_BYTES;
+                destination[..byte_count].fill(0);
+                return Ok(Some((
+                    CapturePacket {
+                        frames: silent_frames as u32,
+                        flags: silent_flags | SILENT_FLAG,
+                        device_position: 0,
+                        qpc_position: 0,
+                    },
+                    byte_count,
+                )));
+            }
+            return Ok(None);
+        }
+
+        let used_samples = output_frames * 2;
+        mix[..used_samples].fill(0.0);
+        for (index, len) in member_lengths.iter_mut().enumerate() {
+            let take = (*len).min(used_samples);
+            let buf = &mut member_buffers[index];
+            for (dst, src) in mix[..take].iter_mut().zip(buf[..take].iter()) {
+                *dst += *src;
+            }
+            if *len > take {
+                buf.copy_within(take..*len, 0);
+                *len -= take;
+            } else {
+                *len = 0;
+            }
+        }
+
+        let byte_count = output_frames * STEREO_BYTES;
+        for (index, sample) in mix[..used_samples].iter().enumerate() {
+            let bytes = sample.to_le_bytes();
+            destination[index * 4..index * 4 + 4].copy_from_slice(&bytes);
+        }
+        Ok(Some((
+            CapturePacket {
+                frames: output_frames as u32,
+                flags: 0,
+                device_position: 0,
+                qpc_position: 0,
+            },
+            byte_count,
+        )))
+    }
+
+    fn has_queued_packet(&self) -> bool {
+        self.members
+            .iter()
+            .any(AudioCaptureSource::has_queued_packet)
+    }
 }
 
 /// Converts packets of an interleaved 5.1/7.1 float32 capture source into
@@ -7496,7 +7691,10 @@ impl MultiInputCaptureSource {
         match self {
             Self::Physical(capture) => Some(capture.endpoint_id()),
             Self::Binaural(capture) => Some(capture.capture.endpoint_id()),
-            Self::ApplicationLoopback(_) | Self::Silence(_) | Self::Network(_) => None,
+            Self::ApplicationLoopback(_)
+            | Self::Silence(_)
+            | Self::Network(_)
+            | Self::ApplicationGroup(_) => None,
         }
     }
 }
@@ -7512,6 +7710,7 @@ impl EndpointLifecycle for MultiInputCaptureSource {
                 receiver.reset_playout();
                 Ok(())
             }
+            Self::ApplicationGroup(group) => group.start(),
         }
     }
 
@@ -7522,6 +7721,7 @@ impl EndpointLifecycle for MultiInputCaptureSource {
             Self::ApplicationLoopback(capture) => capture.stop(),
             Self::Silence(_) => Ok(()),
             Self::Network(_) => Ok(()),
+            Self::ApplicationGroup(group) => group.stop(),
         }
     }
 }
@@ -7540,6 +7740,7 @@ impl AudioCaptureSource for MultiInputCaptureSource {
             }
             Self::Silence(capture) => capture.next_packet_into(destination, bytes_per_frame),
             Self::Network(receiver) => receiver.next_packet_into(destination, bytes_per_frame),
+            Self::ApplicationGroup(group) => group.next_packet_into(destination, bytes_per_frame),
         }
     }
 
@@ -7549,6 +7750,7 @@ impl AudioCaptureSource for MultiInputCaptureSource {
             Self::Binaural(capture) => capture.has_queued_packet(),
             Self::ApplicationLoopback(capture) => capture.has_queued_packet(),
             Self::Silence(_) | Self::Network(_) => false,
+            Self::ApplicationGroup(group) => group.has_queued_packet(),
         }
     }
 }
@@ -8872,6 +9074,79 @@ pub fn resolve_application_restart_with_path(
         });
     }
     Ok((*application).clone())
+}
+
+/// Resolve all independent process-tree roots matching a persisted selector in
+/// an Application Group. Unlike [`resolve_application_restart_with_path`],
+/// multiple independent roots for the same executable (e.g. a game and its
+/// sibling helper process) are all returned so the group captures every one.
+pub fn resolve_application_group_roots(
+    applications: &[ApplicationInfo],
+    expected_executable: &str,
+    expected_executable_path: Option<&str>,
+) -> Result<Vec<ApplicationInfo>, AudioError> {
+    let Some(expected_executable_path) = expected_executable_path else {
+        return Err(AudioError::ApplicationRestartIdentityUnavailable {
+            executable: expected_executable.to_owned(),
+        });
+    };
+    let name_matches = applications
+        .iter()
+        .filter(|application| {
+            application
+                .executable
+                .eq_ignore_ascii_case(expected_executable)
+        })
+        .collect::<Vec<_>>();
+    let path_matches = |same_path: fn(&str, &str) -> bool| {
+        applications
+            .iter()
+            .filter(|application| {
+                application
+                    .executable
+                    .eq_ignore_ascii_case(expected_executable)
+                    && application
+                        .executable_path
+                        .as_deref()
+                        .is_some_and(|actual| same_path(expected_executable_path, actual))
+            })
+            .collect::<Vec<_>>()
+    };
+    let mut matches = path_matches(|expected, actual| actual.eq_ignore_ascii_case(expected));
+    if matches.is_empty() {
+        matches = path_matches(same_versioned_install);
+    }
+    if matches.is_empty() {
+        if name_matches
+            .iter()
+            .any(|application| application.executable_path.is_none())
+        {
+            return Err(AudioError::ApplicationRestartIdentityUnavailable {
+                executable: expected_executable.to_owned(),
+            });
+        }
+        return Err(AudioError::ApplicationRestartNotFound {
+            executable: expected_executable.to_owned(),
+        });
+    }
+    let roots = matches
+        .iter()
+        .copied()
+        .filter(|candidate| {
+            !matches.iter().any(|other| {
+                other.process_id != candidate.process_id
+                    && is_process_ancestor(other, candidate, applications)
+            })
+        })
+        .filter(|candidate| candidate.creation_time_100ns.is_some())
+        .cloned()
+        .collect::<Vec<_>>();
+    if roots.is_empty() {
+        return Err(AudioError::ApplicationRestartIdentityUnavailable {
+            executable: expected_executable.to_owned(),
+        });
+    }
+    Ok(roots)
 }
 
 /// Resolve an application for preparation. The saved PID and creation time
@@ -12384,1879 +12659,4 @@ mod tests {
         // An exact path match is preferred over a version-directory match.
         let exact = process(9, 1, saved, 50);
         assert_eq!(
-            resolve_application_restart_with_path(
-                &[root.clone(), exact.clone()],
-                "Discord.exe",
-                Some(saved)
-            )
-            .unwrap()
-            .process_id,
-            9
-        );
-        // Another install root, a different executable directory, or a
-        // non-version directory change never matches.
-        for other in [
-            r"C:\Users\other\AppData\Local\Discord\app-1.0.9259\Discord.exe",
-            r"C:\Users\u\AppData\Local\Evil\app-1.0.9259\Discord.exe",
-            r"C:\Users\u\AppData\Local\Discord\payload\Discord.exe",
-            r"C:\Users\u\AppData\Local\Discord\app-1.0.9259\sub\Discord.exe",
-            r"C:\Users\u\AppData\Local\Discord\app-\Discord.exe",
-            r"C:\Users\u\AppData\Local\Discord\app-1..2\Discord.exe",
-        ] {
-            assert!(
-                matches!(
-                    resolve_application_restart_with_path(
-                        &[process(5, 1, other, 1)],
-                        "Discord.exe",
-                        Some(saved)
-                    ),
-                    Err(AudioError::ApplicationRestartNotFound { .. })
-                ),
-                "{other}"
-            );
-        }
-        // Two independent updated roots remain ambiguous.
-        let second_root = process(77, 1, updated, 300);
-        assert!(matches!(
-            resolve_application_restart_with_path(&[root, second_root], "Discord.exe", Some(saved)),
-            Err(AudioError::ApplicationRestartAmbiguous { .. })
-        ));
-        assert!(!same_versioned_install(
-            r"C:\A\app-1.0\x\app-1.0\Discord.exe",
-            r"C:\A\app-2.0\x\app-2.0\Discord.exe"
-        ));
-    }
-
-    #[test]
-    fn restart_binding_requires_one_verified_executable_identity() {
-        let candidate = ApplicationInfo {
-            process_id: 7,
-            parent_process_id: 0,
-            executable: "Game.EXE".into(),
-            executable_path: Some(r"C:\Games\Game.EXE".into()),
-            creation_time_100ns: Some(42),
-        };
-        assert_eq!(
-            resolve_application_restart_with_path(
-                std::slice::from_ref(&candidate),
-                "game.exe",
-                Some(r"c:\games\game.exe"),
-            )
-            .unwrap(),
-            candidate
-        );
-        assert!(matches!(
-            resolve_application_restart_with_path(&[], "game.exe", Some(r"C:\Games\Game.EXE")),
-            Err(AudioError::ApplicationRestartNotFound { .. })
-        ));
-        assert!(matches!(
-            resolve_application_restart_with_path(
-                &[
-                    candidate.clone(),
-                    ApplicationInfo {
-                        process_id: 8,
-                        parent_process_id: 0,
-                        ..candidate.clone()
-                    }
-                ],
-                "game.exe",
-                Some(r"C:\Games\Game.EXE")
-            ),
-            Err(AudioError::ApplicationRestartAmbiguous { .. })
-        ));
-        assert!(matches!(
-            resolve_application_restart_with_path(
-                &[ApplicationInfo {
-                    creation_time_100ns: None,
-                    ..candidate
-                }],
-                "game.exe",
-                Some(r"C:\Games\Game.EXE")
-            ),
-            Err(AudioError::ApplicationRestartIdentityUnavailable { .. })
-        ));
-        assert!(matches!(
-            resolve_application_restart_with_path(
-                &[ApplicationInfo {
-                    process_id: 8,
-                    parent_process_id: 0,
-                    executable: "game.exe".into(),
-                    executable_path: Some(r"C:\Games\Game.EXE".into()),
-                    creation_time_100ns: Some(43),
-                }],
-                "game.exe",
-                None,
-            ),
-            Err(AudioError::ApplicationRestartIdentityUnavailable { .. })
-        ));
-    }
-
-    #[test]
-    fn restart_binding_can_require_the_full_executable_path() {
-        let applications = [
-            ApplicationInfo {
-                process_id: 7,
-                parent_process_id: 0,
-                executable: "Game.EXE".into(),
-                executable_path: Some(r"C:\Games\Game.EXE".into()),
-                creation_time_100ns: Some(42),
-            },
-            ApplicationInfo {
-                process_id: 8,
-                parent_process_id: 0,
-                executable: "game.exe".into(),
-                executable_path: Some(r"C:\Tools\Game.EXE".into()),
-                creation_time_100ns: Some(43),
-            },
-        ];
-        let selected = resolve_application_restart_with_path(
-            &applications,
-            "game.exe",
-            Some(r"c:\games\game.exe"),
-        )
-        .unwrap();
-        assert_eq!(selected.process_id, 7);
-        assert!(matches!(
-            resolve_application_restart_with_path(
-                &applications,
-                "game.exe",
-                Some(r"C:\Unknown\Game.EXE")
-            ),
-            Err(AudioError::ApplicationRestartNotFound { .. })
-        ));
-        assert!(matches!(
-            resolve_application_restart_with_path(
-                &[ApplicationInfo {
-                    executable: "game.exe".into(),
-                    executable_path: None,
-                    creation_time_100ns: Some(44),
-                    process_id: 9,
-                    parent_process_id: 0,
-                }],
-                "game.exe",
-                Some(r"C:\Games\Game.EXE")
-            ),
-            Err(AudioError::ApplicationRestartIdentityUnavailable { .. })
-        ));
-        assert!(matches!(
-            resolve_application_restart_with_path(
-                &[ApplicationInfo {
-                    executable: "game.exe".into(),
-                    executable_path: Some(r"C:\Games\Game.EXE".into()),
-                    creation_time_100ns: None,
-                    process_id: 9,
-                    parent_process_id: 0,
-                }],
-                "game.exe",
-                Some(r"C:\Games\Game.EXE")
-            ),
-            Err(AudioError::ApplicationRestartIdentityUnavailable { .. })
-        ));
-    }
-
-    #[test]
-    fn restart_binding_collapses_same_image_process_tree_to_its_root() {
-        let root = ApplicationInfo {
-            process_id: 10,
-            parent_process_id: 1,
-            executable: "Discord.exe".into(),
-            executable_path: Some(r"C:\Apps\Discord.exe".into()),
-            creation_time_100ns: Some(100),
-        };
-        let helper = ApplicationInfo {
-            process_id: 11,
-            parent_process_id: 10,
-            creation_time_100ns: Some(110),
-            ..root.clone()
-        };
-        let renderer = ApplicationInfo {
-            process_id: 12,
-            parent_process_id: 11,
-            creation_time_100ns: Some(120),
-            ..root.clone()
-        };
-        assert_eq!(
-            resolve_application_restart_with_path(
-                &[root.clone(), helper, renderer],
-                "discord.exe",
-                Some(r"c:\apps\discord.exe"),
-            )
-            .unwrap(),
-            root
-        );
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn application_binding_requires_the_observed_identity() {
-        let process_id = std::process::id();
-        let application = enumerate_applications()
-            .unwrap()
-            .into_iter()
-            .find(|application| application.process_id == process_id)
-            .unwrap();
-        assert!(application.executable_path.is_some());
-        let bound = bind_application_with_path(
-            process_id,
-            &application.executable.to_ascii_lowercase(),
-            application.executable_path.as_deref(),
-            application.creation_time_100ns,
-        )
-        .unwrap();
-        assert_eq!(bound, application);
-        let identity_start = std::time::Instant::now();
-        for _ in 0..10 {
-            assert!(application_identity_is_current(
-                process_id,
-                application.creation_time_100ns.unwrap(),
-                application.executable_path.as_deref().unwrap()
-            )
-            .unwrap());
-        }
-        let identity_elapsed = identity_start.elapsed();
-        let inventory_start = std::time::Instant::now();
-        let _ = enumerate_applications().unwrap();
-        println!(
-            "application liveness: 10 direct probes {:?}; one full inventory {:?}",
-            identity_elapsed,
-            inventory_start.elapsed()
-        );
-        assert!(!application_identity_is_current(
-            process_id,
-            application.creation_time_100ns.unwrap().wrapping_add(1),
-            application.executable_path.as_deref().unwrap()
-        )
-        .unwrap());
-        assert!(!application_identity_is_current(
-            process_id,
-            application.creation_time_100ns.unwrap(),
-            "different-path.exe"
-        )
-        .unwrap());
-        assert!(matches!(
-            bind_application(process_id, "different.exe", application.creation_time_100ns),
-            Err(AudioError::ApplicationIdentityChanged { .. })
-        ));
-        assert!(matches!(
-            bind_application(process_id, &application.executable, None),
-            Err(AudioError::ApplicationIdentityUnavailable { .. })
-        ));
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn restarted_process_cannot_inherit_a_stale_binding() {
-        use std::process::Command;
-        use std::time::Duration;
-
-        fn launch_helper() -> std::process::Child {
-            Command::new("cmd.exe")
-                .args(["/C", "ping -n 4 127.0.0.1 > nul"])
-                .spawn()
-                .expect("launch bounded process identity helper")
-        }
-
-        fn observe(child: &std::process::Child) -> ApplicationInfo {
-            for _ in 0..100 {
-                if let Some(application) = enumerate_applications()
-                    .expect("enumerate process identity helper")
-                    .into_iter()
-                    .find(|application| application.process_id == child.id())
-                {
-                    return application;
-                }
-                std::thread::sleep(Duration::from_millis(20));
-            }
-            panic!("process identity helper was not observable")
-        }
-
-        let mut first_child = launch_helper();
-        let first = observe(&first_child);
-        assert_eq!(first.executable.to_ascii_lowercase(), "cmd.exe");
-        let first_bound = bind_application(
-            first.process_id,
-            &first.executable,
-            first.creation_time_100ns,
-        )
-        .expect("fresh process identity should bind");
-        assert_eq!(first_bound, first);
-        assert!(application_identity_is_current(
-            first.process_id,
-            first.creation_time_100ns.unwrap(),
-            first.executable_path.as_deref().unwrap()
-        )
-        .unwrap());
-        first_child.kill().expect("stop first helper");
-        first_child.wait().expect("reap first helper");
-        // A ToolHelp snapshot can outlive the process it observed. Validate
-        // that exact captured entry, without depending on snapshot timing.
-        assert!(
-            validate_application_binding(
-                first.clone(),
-                &first.executable,
-                first.executable_path.as_deref(),
-                first.creation_time_100ns,
-            )
-            .is_err(),
-            "an exited process in a captured inventory must not bind"
-        );
-        assert!(!application_identity_is_current(
-            first.process_id,
-            first.creation_time_100ns.unwrap(),
-            first.executable_path.as_deref().unwrap()
-        )
-        .unwrap_or(false));
-
-        let stale = bind_application(
-            first.process_id,
-            &first.executable,
-            first.creation_time_100ns,
-        );
-        assert!(
-            matches!(
-                stale,
-                Err(AudioError::ApplicationNotFound { .. })
-                    | Err(AudioError::ApplicationIdentityChanged { .. })
-            ),
-            "stale binding result: {stale:?}"
-        );
-
-        let mut second_child = launch_helper();
-        let second = observe(&second_child);
-        assert!(second.creation_time_100ns.is_some());
-        if second.process_id == first.process_id {
-            assert_ne!(second.creation_time_100ns, first.creation_time_100ns);
-            assert!(matches!(
-                bind_application(
-                    first.process_id,
-                    &first.executable,
-                    first.creation_time_100ns,
-                ),
-                Err(AudioError::ApplicationIdentityChanged { .. })
-            ));
-        }
-        second_child.kill().expect("stop second helper");
-        second_child.wait().expect("reap second helper");
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn application_audio_inventory_is_read_only() {
-        let inventory = enumerate_application_audio().unwrap();
-        assert!(inventory.iter().all(|item| {
-            item.process_id != 0
-                && item.active_session_count <= item.total_session_count
-                && item.capture_session_count <= item.total_session_count
-                && item.render_session_count <= item.total_session_count
-        }));
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn application_inventory_is_deterministically_ordered() {
-        let applications = enumerate_applications().unwrap();
-        assert!(applications.windows(2).all(|pair| {
-            pair[0]
-                .executable
-                .to_ascii_lowercase()
-                .cmp(&pair[1].executable.to_ascii_lowercase())
-                .then_with(|| pair[0].process_id.cmp(&pair[1].process_id))
-                .is_le()
-        }));
-    }
-
-    #[test]
-    fn application_inventory_sort_is_case_insensitive_then_pid() {
-        let mut applications = vec![
-            ApplicationInfo {
-                process_id: 20,
-                parent_process_id: 0,
-                executable: "zeta.exe".into(),
-                executable_path: None,
-                creation_time_100ns: Some(2),
-            },
-            ApplicationInfo {
-                process_id: 4,
-                parent_process_id: 0,
-                executable: "Audio.exe".into(),
-                executable_path: None,
-                creation_time_100ns: Some(1),
-            },
-            ApplicationInfo {
-                process_id: 3,
-                parent_process_id: 0,
-                executable: "audio.exe".into(),
-                executable_path: None,
-                creation_time_100ns: Some(0),
-            },
-        ];
-        sort_application_inventory(&mut applications);
-        assert_eq!(
-            applications
-                .iter()
-                .map(|application| (application.executable.as_str(), application.process_id))
-                .collect::<Vec<_>>(),
-            [("audio.exe", 3), ("Audio.exe", 4), ("zeta.exe", 20)]
-        );
-    }
-
-    #[test]
-    fn application_audio_inventory_sort_is_deterministic_and_deduplicated() {
-        let mut inventory = vec![
-            ApplicationAudioInfo {
-                process_id: 20,
-                active_session_count: 1,
-                total_session_count: 1,
-                capture_session_count: 0,
-                render_session_count: 1,
-                display_names: vec!["zulu".into(), "alpha".into(), "alpha".into()],
-                endpoints: Vec::new(),
-            },
-            ApplicationAudioInfo {
-                process_id: 4,
-                active_session_count: 1,
-                total_session_count: 2,
-                capture_session_count: 1,
-                render_session_count: 1,
-                display_names: vec!["voice".into()],
-                endpoints: vec![
-                    ApplicationAudioEndpoint {
-                        endpoint_id: "{b}".into(),
-                        direction: EndpointDirection::Render,
-                        active: true,
-                    },
-                    ApplicationAudioEndpoint {
-                        endpoint_id: "{a}".into(),
-                        direction: EndpointDirection::Render,
-                        active: false,
-                    },
-                    ApplicationAudioEndpoint {
-                        endpoint_id: "{a}".into(),
-                        direction: EndpointDirection::Capture,
-                        active: true,
-                    },
-                ],
-            },
-        ];
-        sort_application_audio_inventory(&mut inventory);
-        assert_eq!(
-            inventory
-                .iter()
-                .map(|item| item.process_id)
-                .collect::<Vec<_>>(),
-            vec![4, 20]
-        );
-        assert_eq!(inventory[1].display_names, vec!["alpha", "zulu"]);
-        assert_eq!(
-            inventory[0]
-                .endpoints
-                .iter()
-                .map(|item| (item.endpoint_id.as_str(), item.direction))
-                .collect::<Vec<_>>(),
-            vec![
-                ("{a}", EndpointDirection::Capture),
-                ("{a}", EndpointDirection::Render),
-                ("{b}", EndpointDirection::Render),
-            ]
-        );
-    }
-
-    #[test]
-    fn audio_endpoints_merge_repeats_and_are_bounded() {
-        let mut endpoints = Vec::new();
-        retain_audio_endpoint(&mut endpoints, "{cable}", EndpointDirection::Render, false);
-        // A second session on the same endpoint merges; any active one wins.
-        retain_audio_endpoint(&mut endpoints, "{cable}", EndpointDirection::Render, true);
-        // The same endpoint ID in the other direction is a separate entry.
-        retain_audio_endpoint(&mut endpoints, "{cable}", EndpointDirection::Capture, false);
-        // An unreadable or oversized ID is dropped.
-        retain_audio_endpoint(&mut endpoints, "", EndpointDirection::Render, true);
-        retain_audio_endpoint(
-            &mut endpoints,
-            &"x".repeat(MAX_APPLICATION_AUDIO_ENDPOINT_ID_BYTES + 1),
-            EndpointDirection::Render,
-            true,
-        );
-        assert_eq!(
-            endpoints,
-            vec![
-                ApplicationAudioEndpoint {
-                    endpoint_id: "{cable}".into(),
-                    direction: EndpointDirection::Render,
-                    active: true,
-                },
-                ApplicationAudioEndpoint {
-                    endpoint_id: "{cable}".into(),
-                    direction: EndpointDirection::Capture,
-                    active: false,
-                },
-            ]
-        );
-        for index in 0..MAX_APPLICATION_AUDIO_ENDPOINTS * 2 {
-            retain_audio_endpoint(
-                &mut endpoints,
-                &format!("{{e{index}}}"),
-                EndpointDirection::Capture,
-                false,
-            );
-        }
-        assert_eq!(endpoints.len(), MAX_APPLICATION_AUDIO_ENDPOINTS);
-    }
-
-    #[test]
-    fn audio_display_names_are_bounded_before_retention() {
-        let mut names = Vec::new();
-        retain_audio_display_name(&mut names, "valid".into());
-        retain_audio_display_name(&mut names, "valid".into());
-        retain_audio_display_name(
-            &mut names,
-            "x".repeat(MAX_APPLICATION_AUDIO_DISPLAY_NAME_BYTES + 1),
-        );
-        for index in 1..=MAX_APPLICATION_AUDIO_DISPLAY_NAMES {
-            retain_audio_display_name(&mut names, format!("name-{index}"));
-        }
-        assert_eq!(names.len(), MAX_APPLICATION_AUDIO_DISPLAY_NAMES);
-        assert!(names.iter().all(|name| {
-            !name.is_empty() && name.len() <= MAX_APPLICATION_AUDIO_DISPLAY_NAME_BYTES
-        }));
-    }
-
-    #[test]
-    fn bounded_recovery_retries_transient_failures_then_succeeds() {
-        let mut calls = 0;
-        let value = retry_transient_audio_operation(5, 0, || {
-            calls += 1;
-            if calls < 3 {
-                Err(AudioError::Windows(windows::core::Error::new(
-                    windows::core::HRESULT(0x88890004_u32 as i32),
-                    "device invalidated",
-                )))
-            } else {
-                Ok(42_u32)
-            }
-        })
-        .unwrap();
-        assert_eq!(value, 42);
-        assert_eq!(calls, 3);
-    }
-
-    #[test]
-    fn bounded_recovery_does_not_retry_non_transient_failures() {
-        let mut calls = 0;
-        let result = retry_transient_audio_operation(5, 0, || {
-            calls += 1;
-            Err::<(), _>(AudioError::Windows(windows::core::Error::new(
-                windows::core::HRESULT(0x80070057_u32 as i32),
-                "invalid argument",
-            )))
-        });
-        assert!(result.is_err());
-        assert_eq!(calls, 1);
-    }
-
-    #[test]
-    fn bounded_recovery_caps_transient_attempts() {
-        let mut calls = 0;
-        let result = retry_transient_audio_operation(99, 0, || {
-            calls += 1;
-            Err::<(), _>(AudioError::Windows(windows::core::Error::new(
-                windows::core::HRESULT(0x88890010_u32 as i32),
-                "service unavailable",
-            )))
-        });
-        assert!(result.is_err());
-        assert_eq!(calls, 5);
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn opening_an_unknown_capture_endpoint_fails_without_starting_audio() {
-        let error = SharedCapture::open("audiorouter-missing-endpoint", 1_000_000);
-        assert!(matches!(error, Err(AudioError::Windows(_))));
-    }
-
-    #[test]
-    fn capture_retry_is_limited_to_e_invalidarg() {
-        let invalid_argument = windows::core::Error::new(
-            windows::core::HRESULT(0x80070057u32 as i32),
-            "invalid argument",
-        );
-        let device_in_use = windows::core::Error::new(
-            windows::core::HRESULT(0x8889000Au32 as i32),
-            "device in use",
-        );
-        let other_failure = windows::core::Error::new(
-            windows::core::HRESULT(0x80004005u32 as i32),
-            "unspecified failure",
-        );
-
-        assert!(should_retry_capture_initialization(&invalid_argument));
-        assert!(!should_retry_capture_initialization(&device_in_use));
-        assert!(!should_retry_capture_initialization(&other_failure));
-    }
-
-    #[test]
-    fn capture_initialize_errors_identify_delivery_mode() {
-        assert_eq!(
-            capture_initialize_operation(true),
-            "IAudioClient::Initialize(capture,event-callback)"
-        );
-        assert_eq!(
-            capture_initialize_operation(false),
-            "IAudioClient::Initialize(capture,polling)"
-        );
-    }
-
-    #[test]
-    fn capture_polling_fallback_keeps_the_qualified_100ms_duration() {
-        assert_eq!(DEFAULT_CAPTURE_POLLING_BUFFER_100NS, 1_000_000);
-    }
-
-    #[test]
-    fn native_bridge_region_round_trips_bounded_blocks_without_audio_access() {
-        let path = std::env::temp_dir().join(format!(
-            "audiorouter-bridge-{}-{}.slot",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let writer = NativeBridgeRegion::create(&path, 2, 128).unwrap();
-        let reader = NativeBridgeRegion::open(&path, 2, 128).unwrap();
-        let input: Vec<f32> = (0..8).map(|value| value as f32 / 8.0).collect();
-        writer.write(4, 1, &input).unwrap();
-        let mut output = vec![0.0; input.len()];
-        let header = reader.read_into(4, &mut output).unwrap();
-        assert_eq!(header.frames, 4);
-        assert_eq!(output, input);
-        assert!(matches!(
-            reader.read_into(5, &mut output),
-            Err(NativeBridgeRegionError::StaleGeneration)
-        ));
-        assert!(matches!(
-            reader.read_into_after(4, 1, &mut output),
-            Err(NativeBridgeRegionError::SequenceRegression)
-        ));
-        assert!(matches!(
-            writer.write(4, 1, &input),
-            Err(NativeBridgeRegionError::SequenceRegression)
-        ));
-        drop(reader);
-        drop(writer);
-        std::fs::remove_file(path).unwrap();
-    }
-
-    #[test]
-    fn native_bridge_sessions_enforce_direction_generation_and_lease() {
-        let unique = |label: &str| {
-            std::env::temp_dir().join(format!(
-                "audiorouter-session-{label}-{}-{}.slot",
-                std::process::id(),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_nanos()
-            ))
-        };
-        let hello = |direction| audiorouter_protocol::AudioBridgeHello {
-            protocol_major: audiorouter_protocol::AUDIO_BRIDGE_PROTOCOL_MAJOR,
-            protocol_minor: audiorouter_protocol::AUDIO_BRIDGE_PROTOCOL_MINOR,
-            bus_id: "bus-session".into(),
-            direction,
-            generation: 12,
-            sample_rate_hz: 48_000,
-            channels: 2,
-            frames_per_quantum: 4,
-            lease_ms: 1_000,
-        };
-        let capture_path = unique("capture");
-        let render_path = unique("render");
-        let mut capture = NativeBridgeSession::create(
-            &capture_path,
-            hello(audiorouter_protocol::AudioBridgeDirection::CaptureSink),
-        )
-        .unwrap();
-        let capture_reader = NativeBridgeRegion::open(&capture_path, 2, 4).unwrap();
-        let input = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8];
-        assert_eq!(capture.write(&input).unwrap(), 1);
-        let mut captured = [0.0; 8];
-        assert_eq!(
-            capture_reader
-                .read_into(12, &mut captured)
-                .unwrap()
-                .sequence,
-            1
-        );
-        assert_eq!(captured, input);
-        assert!(matches!(
-            capture.read_into(&mut captured),
-            Err(NativeBridgeSessionError::WrongDirection)
-        ));
-
-        let mut render = NativeBridgeSession::create(
-            &render_path,
-            hello(audiorouter_protocol::AudioBridgeDirection::RenderSource),
-        )
-        .unwrap();
-        let render_writer = NativeBridgeRegion::open(&render_path, 2, 4).unwrap();
-        render_writer.write(12, 9, &input).unwrap();
-        assert_eq!(
-            render.read_into_after(8, &mut captured).unwrap().sequence,
-            9
-        );
-        assert!(matches!(
-            render.read_into_after(9, &mut captured),
-            Err(NativeBridgeSessionError::Region(
-                NativeBridgeRegionError::SequenceRegression
-            ))
-        ));
-        assert!(matches!(
-            render.write(&input),
-            Err(NativeBridgeSessionError::WrongDirection)
-        ));
-
-        let base = std::time::Instant::now();
-        capture.heartbeat_at(base).unwrap();
-        assert!(matches!(
-            capture.heartbeat_at(base + std::time::Duration::from_millis(1_001)),
-            Err(NativeBridgeSessionError::LeaseExpired)
-        ));
-        assert!(render.is_lease_expired_at(base + std::time::Duration::from_millis(1_001)));
-        drop(render_writer);
-        drop(capture_reader);
-        drop(render);
-        drop(capture);
-        std::fs::remove_file(capture_path).unwrap();
-        std::fs::remove_file(render_path).unwrap();
-    }
-
-    #[test]
-    fn native_bridge_realtime_writer_publishes_engine_tap_without_allocation() {
-        let path = std::env::temp_dir().join(format!(
-            "audiorouter-tap-{}-{}.slot",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let region = NativeBridgeRegion::create(&path, 2, 128).unwrap();
-        let reader = NativeBridgeRegion::open(&path, 2, 128).unwrap();
-        let writer = NativeBridgeRealtimeWriter::new(region, 9).unwrap();
-        let mut block = audiorouter_engine::AudioBlock::new(2, 4).unwrap();
-        block
-            .copy_from_interleaved(&[1.0, 10.0, 2.0, 20.0, 3.0, 30.0, 4.0, 40.0])
-            .unwrap();
-        <NativeBridgeRealtimeWriter as audiorouter_engine::AudioTap>::on_processed_block(
-            &writer, 0, &block,
-        );
-        assert_eq!(writer.published_blocks(), 1);
-        let mut output = [0.0; 8];
-        reader.read_into(9, &mut output).unwrap();
-        assert_eq!(output, [1.0, 10.0, 2.0, 20.0, 3.0, 30.0, 4.0, 40.0]);
-        drop(reader);
-        std::fs::remove_file(path).unwrap();
-    }
-
-    #[test]
-    fn native_bridge_realtime_writer_resumes_after_existing_sequence() {
-        let path = std::env::temp_dir().join(format!(
-            "audiorouter-tap-resume-{}-{}.slot",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let region = NativeBridgeRegion::create(&path, 1, 128).unwrap();
-        region.write(9, 7, &[0.25]).unwrap();
-        let reader = NativeBridgeRegion::open(&path, 1, 128).unwrap();
-        let writer = NativeBridgeRealtimeWriter::new(region, 9).unwrap();
-        let mut block = audiorouter_engine::AudioBlock::new(1, 1).unwrap();
-        block.copy_from_interleaved(&[0.75]).unwrap();
-        <NativeBridgeRealtimeWriter as audiorouter_engine::AudioTap>::on_processed_block(
-            &writer, 0, &block,
-        );
-        let mut output = [0.0];
-        let header = reader.read_into_after(9, 7, &mut output).unwrap();
-        assert_eq!(header.sequence, 8);
-        assert_eq!(output, [0.75]);
-        drop(reader);
-        std::fs::remove_file(path).unwrap();
-    }
-
-    #[test]
-    fn native_bridge_region_rejects_seqlock_counter_overflow() {
-        let path = std::env::temp_dir().join(format!(
-            "audiorouter-overflow-{}-{}.slot",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let region = NativeBridgeRegion::create(&path, 1, 1).unwrap();
-        region
-            .state()
-            .store(u64::MAX - 1, std::sync::atomic::Ordering::Release);
-        assert!(matches!(
-            region.write(9, 1, &[0.0]),
-            Err(NativeBridgeRegionError::SequenceExhausted)
-        ));
-        std::fs::remove_file(path).unwrap();
-    }
-
-    #[test]
-    fn native_bridge_region_silences_destination_on_nonfinite_payloads() {
-        let path = std::env::temp_dir().join(format!(
-            "audiorouter-nonfinite-{}-{}.slot",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let region = NativeBridgeRegion::create(&path, 1, 2).unwrap();
-        region.write(9, 1, &[0.25, 0.5]).unwrap();
-        region.store(
-            BRIDGE_PAYLOAD_OFFSET + std::mem::size_of::<f64>(),
-            f64::NAN.to_le_bytes(),
-        );
-        let mut output = [9.0, 9.0];
-        assert!(matches!(
-            region.read_into(9, &mut output),
-            Err(NativeBridgeRegionError::InvalidFrame)
-        ));
-        assert_eq!(output, [0.0, 0.0]);
-        std::fs::remove_file(path).unwrap();
-    }
-
-    #[test]
-    fn native_bridge_float64_mapping_preserves_pcm32_precision() {
-        let path = std::env::temp_dir().join(format!(
-            "audiorouter-float64-{}-{}.slot",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let region = NativeBridgeRegion::create(&path, 2, 128).unwrap();
-        assert_eq!(region.mapping_bytes(), BRIDGE_PAYLOAD_OFFSET + 2 * 128 * 8);
-        let pcm = [1_073_741_889_i32, -1_234_567_891_i32];
-        let input = pcm.map(|sample| f64::from(sample) / 2_147_483_648.0);
-        region.write_f64(4, 1, &input).unwrap();
-        assert_eq!(
-            f64::from_le_bytes(region.load(BRIDGE_PAYLOAD_OFFSET)),
-            input[0]
-        );
-        let mut output = [0.0_f64; 2];
-        let header = region.read_into_f64(4, &mut output).unwrap();
-        assert_eq!(output, input);
-        assert_eq!(header.payload_bytes, 16);
-        let recovered = output.map(|sample| (sample * 2_147_483_648.0).round() as i32);
-        assert_eq!(recovered, pcm);
-        region.write(4, 2, &[0.25_f32, 0.5_f32]).unwrap();
-        let widened = f64::from_le_bytes(region.load(BRIDGE_PAYLOAD_OFFSET));
-        assert_eq!(widened, f64::from(0.25_f32));
-        std::fs::remove_file(path).unwrap();
-    }
-
-    #[test]
-    fn native_bridge_header_announces_float64_acknowledges_reads_and_exposes_counters() {
-        let path = std::env::temp_dir().join(format!(
-            "audiorouter-header-{}-{}.slot",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let region = NativeBridgeRegion::create(&path, 2, 4).unwrap();
-        // Layout mirrors AR_BRIDGE_SHARED_HEADER's C_ASSERTs in bridgeio.h.
-        assert_eq!(region.mapping_bytes(), 128 + 2 * 4 * 8);
-        assert_eq!(
-            u32::from_le_bytes(region.load(88)),
-            8,
-            "a new region announces float64 samples"
-        );
-        assert_eq!(region.counters(), NativeBridgeStreamCounters::default());
-        region.write_f64(9, 3, &[0.5, -0.5]).unwrap();
-        let mut output = [0.0_f64; 2];
-        region.read_into_f64(9, &mut output).unwrap();
-        assert_eq!(
-            u64::from_le_bytes(region.load(96)),
-            3,
-            "the consumer acknowledges the block it read"
-        );
-        assert_eq!(
-            region.consumer_sequence(),
-            3,
-            "producers see the same acknowledgement"
-        );
-        // Simulate the driver-written counters and check each field offset.
-        for (index, value) in (1_u64..=7).enumerate() {
-            region.store(32 + index * 8, value.to_le_bytes());
-        }
-        assert_eq!(
-            region.counters(),
-            NativeBridgeStreamCounters {
-                underrun_frames: 1,
-                overrun_frames: 2,
-                sequence_gaps: 3,
-                non_finite_samples: 4,
-                format_mismatches: 5,
-                last_device_position: 6,
-                last_qpc_time: 7,
-            }
-        );
-        // Packet outcome counters follow ReaderSequence (bridgeio.h offsets
-        // 104/112/120) and do not alias the stream counters.
-        assert_eq!(
-            region.packet_counters(),
-            NativeBridgePacketCounters::default()
-        );
-        for (index, value) in (11_u64..=13).enumerate() {
-            region.store(104 + index * 8, value.to_le_bytes());
-        }
-        assert_eq!(
-            region.packet_counters(),
-            NativeBridgePacketCounters {
-                accepted: 11,
-                late: 12,
-                overrun: 13,
-            }
-        );
-        assert_eq!(region.counters().last_qpc_time, 7);
-        assert_eq!(region.consumer_sequence(), 3);
-        // A header without the negotiated sample size must not be decoded.
-        region.store(88, 4_u32.to_le_bytes());
-        assert_eq!(
-            region.read_into_f64(9, &mut output),
-            Err(NativeBridgeRegionError::SampleSizeMismatch)
-        );
-        drop(region);
-        std::fs::remove_file(path).unwrap();
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn native_bridge_protocol_1_1_abi_matches_driver_header() {
-        // Exact codes from the C_ASSERTs in bridgeio.h (METHOD_BUFFERED).
-        assert_eq!(IOCTL_AUDIOROUTER_BRIDGE_OPEN, 0x0022_E000);
-        assert_eq!(IOCTL_AUDIOROUTER_BRIDGE_CLOSE, 0x0022_E004);
-        assert_eq!(IOCTL_AUDIOROUTER_BRIDGE_HEARTBEAT, 0x0022_E008);
-        assert_eq!(IOCTL_AUDIOROUTER_BRIDGE_QUERY, 0x0022_600C);
-        // AR_BRIDGE_CAP_PACKET_COUNTERS and AR_BRIDGE_PACKET_COUNTERS_OFFSET.
-        assert_eq!(NATIVE_DRIVER_CAP_PACKET_COUNTERS, 0x40);
-        assert_eq!(BRIDGE_PACKET_COUNTERS_OFFSET, 104);
-        assert_eq!(std::mem::size_of::<NativeBridgeOpenExtension>(), 64);
-        assert_eq!(std::mem::offset_of!(NativeBridgeOpenExtension, flags), 4);
-        assert_eq!(std::mem::size_of::<NativeBridgeOpenRequestEx>(), 240);
-        assert_eq!(
-            std::mem::offset_of!(NativeBridgeOpenRequestEx, extension),
-            176
-        );
-        assert_eq!(
-            std::mem::offset_of!(NativeBridgeOpenRequest, generation),
-            24
-        );
-        assert_eq!(
-            std::mem::offset_of!(NativeBridgeOpenRequest, section_handle),
-            32
-        );
-        assert_eq!(
-            std::mem::offset_of!(NativeBridgeOpenRequest, mapping_bytes),
-            40
-        );
-        assert_eq!(std::mem::offset_of!(NativeBridgeOpenRequest, bus_id), 48);
-        assert_eq!(std::mem::size_of::<NativeBridgeDriverInfoRaw>(), 104);
-        assert_eq!(
-            std::mem::offset_of!(NativeBridgeDriverInfoRaw, driver_version),
-            4
-        );
-        assert_eq!(
-            std::mem::offset_of!(NativeBridgeDriverInfoRaw, cable_count),
-            12
-        );
-        assert_eq!(
-            std::mem::offset_of!(NativeBridgeDriverInfoRaw, capabilities),
-            24
-        );
-        assert_eq!(
-            std::mem::offset_of!(NativeBridgeDriverInfoRaw, default_period_frames),
-            36
-        );
-
-        let hello = audiorouter_protocol::AudioBridgeHello {
-            protocol_major: audiorouter_protocol::AUDIO_BRIDGE_PROTOCOL_MAJOR,
-            protocol_minor: audiorouter_protocol::AUDIO_BRIDGE_PROTOCOL_MINOR,
-            bus_id: "cable-h".to_owned(),
-            direction: audiorouter_protocol::AudioBridgeDirection::RenderSource,
-            generation: 3,
-            sample_rate_hz: 96_000,
-            channels: 2,
-            frames_per_quantum: 128,
-            lease_ms: 1_000,
-        };
-        let request = native_bridge_open_request_ex(&hello, 7, 128 + 2 * 128 * 8).unwrap();
-        assert_eq!(request.extension.extension_bytes, 64);
-        assert_eq!(request.extension.flags, NATIVE_DRIVER_OPEN_FLAG_FLOAT64);
-        assert_eq!(request.extension.reserved, [0; 14]);
-        assert_eq!(request.request.mapping_bytes, 128 + 2 * 128 * 8);
-    }
-
-    #[test]
-    fn native_driver_bridge_carries_eight_channels_while_internal_bridge_keeps_two() {
-        // AR_BRIDGE_MAX_CHANNELS / AR_BRIDGE_MAX_PAYLOAD_BYTES in bridgeio.h.
-        assert_eq!(NATIVE_DRIVER_MAX_CHANNELS, 8);
-        assert_eq!(NATIVE_DRIVER_MAX_PAYLOAD_BYTES, 262_144);
-        let hello = audiorouter_protocol::AudioBridgeHello {
-            protocol_major: audiorouter_protocol::AUDIO_BRIDGE_PROTOCOL_MAJOR,
-            protocol_minor: audiorouter_protocol::AUDIO_BRIDGE_PROTOCOL_MINOR,
-            bus_id: "cable-b".to_owned(),
-            direction: audiorouter_protocol::AudioBridgeDirection::CaptureSink,
-            generation: 5,
-            sample_rate_hz: 96_000,
-            channels: 8,
-            frames_per_quantum: audiorouter_protocol::MAX_AUDIO_BRIDGE_FRAMES,
-            lease_ms: 1_000,
-        };
-        assert_eq!(
-            hello.validate(),
-            Err(audiorouter_protocol::AudioBridgeContractError::InvalidChannels),
-            "the internal AudioBridge protocol stays at 2 channels"
-        );
-        assert!(hello
-            .validate_with_max_channels(NATIVE_DRIVER_MAX_CHANNELS)
-            .is_ok());
-        let nine = audiorouter_protocol::AudioBridgeHello {
-            channels: 9,
-            ..hello.clone()
-        };
-        assert!(nine
-            .validate_with_max_channels(NATIVE_DRIVER_MAX_CHANNELS)
-            .is_err());
-
-        let path = std::env::temp_dir().join(format!(
-            "audiorouter-8ch-{}-{}.slot",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let mut session = NativeBridgeSession::create(&path, hello.clone()).unwrap();
-        assert_eq!(
-            session.mapping_bytes(),
-            128 + NATIVE_DRIVER_MAX_PAYLOAD_BYTES
-        );
-        let samples: Vec<f64> = (0..8 * 4096_i32)
-            .map(|index| f64::from(index - 16_384) / 2_147_483_648.0)
-            .collect();
-        session.write_f64(&samples).unwrap();
-        let reader = NativeBridgeRegion::open(&path, 8, 4096).unwrap();
-        let mut output = vec![0.0_f64; samples.len()];
-        let header = reader.read_into_f64(5, &mut output).unwrap();
-        assert_eq!(header.channels, 8);
-        assert_eq!(
-            header.payload_bytes as usize,
-            NATIVE_DRIVER_MAX_PAYLOAD_BYTES
-        );
-        assert_eq!(
-            output, samples,
-            "a full 7.1 quantum round-trips bit-exactly"
-        );
-        drop(reader);
-        drop(session);
-        let _ = std::fs::remove_file(&path);
-        assert!(NativeBridgeRegion::create(&path, 9, 128).is_err());
-        let _ = std::fs::remove_file(&path);
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn native_driver_open_request_accepts_eight_channels() {
-        let hello = audiorouter_protocol::AudioBridgeHello {
-            protocol_major: audiorouter_protocol::AUDIO_BRIDGE_PROTOCOL_MAJOR,
-            protocol_minor: audiorouter_protocol::AUDIO_BRIDGE_PROTOCOL_MINOR,
-            bus_id: "cable-a".to_owned(),
-            direction: audiorouter_protocol::AudioBridgeDirection::RenderSource,
-            generation: 2,
-            sample_rate_hz: 48_000,
-            channels: 8,
-            frames_per_quantum: 128,
-            lease_ms: 1_000,
-        };
-        let request = native_bridge_open_request_ex(&hello, 1, 128 + 8 * 128 * 8).unwrap();
-        assert_eq!(request.request.channels, 8);
-        let nine = audiorouter_protocol::AudioBridgeHello {
-            channels: 9,
-            ..hello
-        };
-        assert!(native_bridge_open_request_ex(&nine, 1, 128 + 9 * 128 * 8).is_err());
-    }
-
-    #[test]
-    fn native_bridge_driver_info_requires_float64_and_protocol_1_1() {
-        let info = NativeBridgeDriverInfo {
-            protocol_major: 1,
-            protocol_minor: 1,
-            driver_version: [0, 2, 0, 0],
-            cable_count: 2,
-            max_cables: 8,
-            max_channels: 8,
-            capabilities: NATIVE_DRIVER_CAP_SAMPLE_FLOAT64 | NATIVE_DRIVER_CAP_STREAM_COUNTERS,
-            supported_rates: 7,
-            min_period_frames: 0,
-            default_period_frames: 0,
-        };
-        assert_eq!(info.check_compatible(), Ok(()));
-        assert!(info.has(NATIVE_DRIVER_CAP_STREAM_COUNTERS));
-        assert!(!info.has(NATIVE_DRIVER_CAP_LOW_LATENCY_PERIODS));
-        let no_float64 = NativeBridgeDriverInfo {
-            capabilities: NATIVE_DRIVER_CAP_STREAM_COUNTERS,
-            ..info
-        };
-        assert_eq!(
-            no_float64.check_compatible(),
-            Err(NativeBridgeDriverError::MissingCapability),
-            "no silent float32 fallback"
-        );
-        for (major, minor) in [(2, 0), (0, 9), (1, 0)] {
-            let other = NativeBridgeDriverInfo {
-                protocol_major: major,
-                protocol_minor: minor,
-                ..info
-            };
-            assert_eq!(
-                other.check_compatible(),
-                Err(NativeBridgeDriverError::VersionMismatch)
-            );
-        }
-        assert!(NativeBridgeDriverError::VersionMismatch
-            .user_message()
-            .contains("repair it from Setup"));
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn native_bridge_driver_statuses_classify_through_the_real_ntstatus_mapping() {
-        // The I/O manager converts the driver's NTSTATUS with this routine;
-        // use it rather than a hand-copied table so a wrong code fails here.
-        #[link(name = "ntdll")]
-        extern "system" {
-            fn RtlNtStatusToDosError(status: i32) -> u32;
-        }
-        let cases = [
-            (0xC000_0059_u32, NativeBridgeDriverError::VersionMismatch),
-            (0xC000_00BB, NativeBridgeDriverError::NotSupported),
-            (0xC000_0043, NativeBridgeDriverError::LeaseHeld),
-            (0xC000_0022, NativeBridgeDriverError::AccessDenied),
-            (0xC000_009D, NativeBridgeDriverError::CableNotEnabled),
-            (0xC000_0184, NativeBridgeDriverError::LeaseNotActive),
-            (0xC000_000D, NativeBridgeDriverError::Other),
-        ];
-        for (status, expected) in cases {
-            // SAFETY: a pure ntdll lookup with no pointers or side effects.
-            let win32 = unsafe { RtlNtStatusToDosError(status as i32) };
-            let error = windows::core::Error::from(windows::core::HRESULT::from_win32(win32));
-            assert_eq!(
-                classify_native_bridge_error(&error),
-                expected,
-                "NTSTATUS {status:#x}"
-            );
-        }
-        let missing = windows::core::Error::from(windows::core::HRESULT::from_win32(2));
-        assert_eq!(
-            classify_native_bridge_error(&missing),
-            NativeBridgeDriverError::DriverUnavailable
-        );
-    }
-
-    #[test]
-    fn native_bridge_float64_session_round_trips_pcm32_without_narrowing() {
-        let path = std::env::temp_dir().join(format!(
-            "audiorouter-float64-session-{}-{}.slot",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let capture = audiorouter_protocol::AudioBridgeHello {
-            protocol_major: audiorouter_protocol::AUDIO_BRIDGE_PROTOCOL_MAJOR,
-            protocol_minor: audiorouter_protocol::AUDIO_BRIDGE_PROTOCOL_MINOR,
-            bus_id: "cable-a".into(),
-            direction: audiorouter_protocol::AudioBridgeDirection::CaptureSink,
-            generation: 5,
-            sample_rate_hz: 48_000,
-            channels: 2,
-            frames_per_quantum: 128,
-            lease_ms: 1_000,
-        };
-        let mut writer = NativeBridgeSession::create(&path, capture.clone()).unwrap();
-        assert_eq!(writer.mapping_bytes(), BRIDGE_PAYLOAD_OFFSET + 2 * 128 * 8);
-        let pcm = [1_073_741_889_i32, -1_234_567_891_i32];
-        let samples = pcm.map(|sample| f64::from(sample) / 2_147_483_648.0);
-        assert_eq!(writer.write_f64(&samples).unwrap(), 1);
-        let mut render = capture;
-        render.direction = audiorouter_protocol::AudioBridgeDirection::RenderSource;
-        let reader = NativeBridgeSession::open(&path, render).unwrap();
-        let mut output = [0.0_f64; 2];
-        let header = reader.read_into_f64(&mut output).unwrap();
-        assert_eq!(header.payload_bytes, 16);
-        assert_eq!(output, samples);
-        assert_eq!(
-            output.map(|sample| (sample * 2_147_483_648.0).round() as i32),
-            pcm
-        );
-        drop(reader);
-        writer.remove_owned_mapping().unwrap();
-    }
-
-    #[test]
-    fn native_bridge_primed_session_is_readable_before_open_and_advances_sequence() {
-        let path = std::env::temp_dir().join(format!(
-            "audiorouter-primed-{}-{}.slot",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let hello = audiorouter_protocol::AudioBridgeHello {
-            protocol_major: audiorouter_protocol::AUDIO_BRIDGE_PROTOCOL_MAJOR,
-            protocol_minor: audiorouter_protocol::AUDIO_BRIDGE_PROTOCOL_MINOR,
-            bus_id: "cable-b".into(),
-            direction: audiorouter_protocol::AudioBridgeDirection::CaptureSink,
-            generation: 7,
-            sample_rate_hz: 48_000,
-            channels: 2,
-            frames_per_quantum: 128,
-            lease_ms: 1_000,
-        };
-        let samples = vec![0.125; 256];
-        let mut writer =
-            NativeBridgeSession::create_primed(&path, hello.clone(), &samples).unwrap();
-        let mut reader_hello = hello.clone();
-        reader_hello.direction = audiorouter_protocol::AudioBridgeDirection::RenderSource;
-        let reader = NativeBridgeSession::open(&path, reader_hello.clone()).unwrap();
-        let mut output = vec![0.0; 256];
-        let header = reader.read_into_f64(&mut output).unwrap();
-        assert_eq!(
-            (header.generation, header.sequence, header.frames),
-            (7, 1, 128)
-        );
-        assert_eq!(output, samples);
-        assert_eq!(writer.write_f64(&samples).unwrap(), 2);
-        drop(reader);
-        writer.remove_owned_mapping().unwrap();
-
-        assert!(matches!(
-            NativeBridgeSession::create_primed(&path, reader_hello, &samples),
-            Err(NativeBridgeSessionError::WrongDirection)
-        ));
-        assert!(!path.exists());
-        for invalid in [vec![], vec![f64::NAN; 256], vec![0.0; 257]] {
-            assert!(NativeBridgeSession::create_primed(&path, hello.clone(), &invalid).is_err());
-            assert!(!path.exists(), "failed prime must remove its owned mapping");
-        }
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn native_bridge_prepared_activation_failure_removes_owned_file() {
-        let path = std::env::temp_dir().join(format!(
-            "bridge-activation-failure-{}.slot",
-            std::process::id()
-        ));
-        let hello = audiorouter_protocol::AudioBridgeHello {
-            protocol_major: audiorouter_protocol::AUDIO_BRIDGE_PROTOCOL_MAJOR,
-            protocol_minor: audiorouter_protocol::AUDIO_BRIDGE_PROTOCOL_MINOR,
-            bus_id: "cable-b".into(),
-            direction: audiorouter_protocol::AudioBridgeDirection::CaptureSink,
-            generation: 7,
-            sample_rate_hz: 48_000,
-            channels: 2,
-            frames_per_quantum: 128,
-            lease_ms: 1_000,
-        };
-        let prepared = NativeBridgeSession::create_primed(&path, hello, &[0.125; 256]).unwrap();
-        let view = NativeBridgeRegion::open(&path, 2, 128).unwrap();
-        // Deliberately absent device: this regression never opens a real driver.
-        assert!(NativeBridgeController::activate_prepared_section(
-            r"\\.\AudioRouterAbsentActivationTest-8352D503-2D64-44EC-BC81-31A5B18C9191",
-            prepared
-        )
-        .is_err());
-        assert!(!path.exists());
-        drop(view);
-    }
-
-    #[test]
-    fn native_bridge_region_rejects_invalid_shapes_before_mapping() {
-        let path =
-            std::env::temp_dir().join(format!("audiorouter-invalid-bridge-{}", std::process::id()));
-        assert!(matches!(
-            NativeBridgeRegion::create(&path, NATIVE_DRIVER_MAX_CHANNELS + 1, 128),
-            Err(NativeBridgeRegionError::InvalidFrame)
-        ));
-        assert!(matches!(
-            NativeBridgeRegion::create(&path, 2, 0),
-            Err(NativeBridgeRegionError::InvalidFrame)
-        ));
-    }
-
-    #[test]
-    fn native_bridge_region_open_rejects_a_non_regular_leaf() {
-        let path = std::env::temp_dir().join(format!(
-            "audiorouter-nonregular-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir(&path).unwrap();
-        assert!(matches!(
-            NativeBridgeRegion::open(&path, 1, 2),
-            Err(NativeBridgeRegionError::InvalidPath)
-        ));
-        std::fs::remove_dir(path).unwrap();
-    }
-
-    #[test]
-    fn native_bridge_session_negotiates_identity_and_assigns_sequences() {
-        let path = std::env::temp_dir().join(format!(
-            "audiorouter-session-{}-{}.slot",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let hello = audiorouter_protocol::AudioBridgeHello {
-            protocol_major: audiorouter_protocol::AUDIO_BRIDGE_PROTOCOL_MAJOR,
-            protocol_minor: audiorouter_protocol::AUDIO_BRIDGE_PROTOCOL_MINOR,
-            bus_id: "bus-main".to_owned(),
-            direction: audiorouter_protocol::AudioBridgeDirection::CaptureSink,
-            generation: 9,
-            sample_rate_hz: 48_000,
-            channels: 2,
-            frames_per_quantum: 4,
-            lease_ms: 1_000,
-        };
-        let mut writer = NativeBridgeSession::create(&path, hello.clone()).unwrap();
-        let mut reader_hello = hello;
-        reader_hello.direction = audiorouter_protocol::AudioBridgeDirection::RenderSource;
-        let reader = NativeBridgeSession::open(&path, reader_hello).unwrap();
-        let input = [0.25_f32, -0.25, 0.5, -0.5];
-        assert_eq!(writer.write(&input).unwrap(), 1);
-        assert_eq!(writer.write(&input).unwrap(), 2);
-        let mut output = [0.0; 4];
-        let header = reader.read_into(&mut output).unwrap();
-        assert_eq!(header.sequence, 2);
-        assert!(matches!(
-            reader.read_into_after(2, &mut output),
-            Err(NativeBridgeSessionError::Region(
-                NativeBridgeRegionError::SequenceRegression
-            ))
-        ));
-        assert_eq!(output, input);
-        assert_eq!(reader.hello().bus_id, "bus-main");
-        drop(reader);
-        drop(writer);
-        std::fs::remove_file(path).unwrap();
-    }
-
-    #[test]
-    fn native_bridge_session_owner_cleanup_removes_created_mapping() {
-        let path = std::env::temp_dir().join(format!(
-            "audiorouter-owned-mapping-{}-{}.slot",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let hello = audiorouter_protocol::AudioBridgeHello {
-            protocol_major: audiorouter_protocol::AUDIO_BRIDGE_PROTOCOL_MAJOR,
-            protocol_minor: audiorouter_protocol::AUDIO_BRIDGE_PROTOCOL_MINOR,
-            bus_id: "bus-cleanup".into(),
-            direction: audiorouter_protocol::AudioBridgeDirection::CaptureSink,
-            generation: 1,
-            sample_rate_hz: 48_000,
-            channels: 2,
-            frames_per_quantum: 128,
-            lease_ms: 1_000,
-        };
-        let session = NativeBridgeSession::create(&path, hello).unwrap();
-        assert!(path.exists());
-        session.remove_owned_mapping().unwrap();
-        assert!(!path.exists());
-    }
-
-    #[test]
-    fn native_bridge_session_exposes_a_second_realtime_producer_view() {
-        let path = std::env::temp_dir().join(format!(
-            "audiorouter-session-tap-{}-{}.slot",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let hello = audiorouter_protocol::AudioBridgeHello {
-            protocol_major: audiorouter_protocol::AUDIO_BRIDGE_PROTOCOL_MAJOR,
-            protocol_minor: audiorouter_protocol::AUDIO_BRIDGE_PROTOCOL_MINOR,
-            bus_id: "bus-tap".to_owned(),
-            direction: audiorouter_protocol::AudioBridgeDirection::CaptureSink,
-            generation: 11,
-            sample_rate_hz: 48_000,
-            channels: 2,
-            frames_per_quantum: 4,
-            lease_ms: 1_000,
-        };
-        let session = NativeBridgeSession::create(&path, hello).unwrap();
-        let tap = session.realtime_writer().unwrap();
-        let reader = NativeBridgeRegion::open(&path, 2, 4).unwrap();
-        let mut block = audiorouter_engine::AudioBlock::new(2, 2).unwrap();
-        block.copy_from_interleaved(&[0.1, 0.2, 0.3, 0.4]).unwrap();
-        <NativeBridgeRealtimeWriter as audiorouter_engine::AudioTap>::on_processed_block(
-            &tap, 0, &block,
-        );
-        let mut output = [0.0; 4];
-        reader.read_into(11, &mut output).unwrap();
-        assert_eq!(output, [0.1, 0.2, 0.3, 0.4]);
-        drop(reader);
-        drop(tap);
-        drop(session);
-        std::fs::remove_file(path).unwrap();
-    }
-
-    #[test]
-    fn native_bridge_session_enforces_directional_read_write_roles() {
-        let path = std::env::temp_dir().join(format!(
-            "audiorouter-direction-{}-{}.slot",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let hello = audiorouter_protocol::AudioBridgeHello {
-            protocol_major: audiorouter_protocol::AUDIO_BRIDGE_PROTOCOL_MAJOR,
-            protocol_minor: audiorouter_protocol::AUDIO_BRIDGE_PROTOCOL_MINOR,
-            bus_id: "bus-direction".into(),
-            direction: audiorouter_protocol::AudioBridgeDirection::RenderSource,
-            generation: 12,
-            sample_rate_hz: 48_000,
-            channels: 2,
-            frames_per_quantum: 4,
-            lease_ms: 1_000,
-        };
-        let mut session = NativeBridgeSession::create(&path, hello).unwrap();
-        assert!(matches!(
-            session.write(&[0.0, 0.0]),
-            Err(NativeBridgeSessionError::WrongDirection)
-        ));
-        assert!(matches!(
-            session.realtime_writer(),
-            Err(NativeBridgeSessionError::WrongDirection)
-        ));
-        std::fs::remove_file(path).unwrap();
-    }
-
-    #[test]
-    fn native_bridge_session_rejects_invalid_identity_before_file_creation() {
-        let path = std::env::temp_dir().join(format!(
-            "audiorouter-invalid-session-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let hello = audiorouter_protocol::AudioBridgeHello {
-            protocol_major: audiorouter_protocol::AUDIO_BRIDGE_PROTOCOL_MAJOR,
-            protocol_minor: audiorouter_protocol::AUDIO_BRIDGE_PROTOCOL_MINOR,
-            bus_id: String::new(),
-            direction: audiorouter_protocol::AudioBridgeDirection::CaptureSink,
-            generation: 1,
-            sample_rate_hz: 48_000,
-            channels: 2,
-            frames_per_quantum: 128,
-            lease_ms: 1_000,
-        };
-        assert!(matches!(
-            NativeBridgeSession::create(&path, hello),
-            Err(NativeBridgeSessionError::InvalidHello(
-                audiorouter_protocol::AudioBridgeContractError::EmptyBusId
-            ))
-        ));
-        assert!(!path.exists());
-    }
-
-    #[test]
-    fn native_bridge_session_expires_and_cannot_be_revived_by_a_late_heartbeat() {
-        let path = std::env::temp_dir().join(format!(
-            "audiorouter-expired-session-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let hello = audiorouter_protocol::AudioBridgeHello {
-            protocol_major: audiorouter_protocol::AUDIO_BRIDGE_PROTOCOL_MAJOR,
-            protocol_minor: audiorouter_protocol::AUDIO_BRIDGE_PROTOCOL_MINOR,
-            bus_id: "bus-main".to_owned(),
-            direction: audiorouter_protocol::AudioBridgeDirection::CaptureSink,
-            generation: 10,
-            sample_rate_hz: 48_000,
-            channels: 2,
-            frames_per_quantum: 4,
-            lease_ms: 1_000,
-        };
-        let mut session = NativeBridgeSession::create(&path, hello).unwrap();
-        let base = std::time::Instant::now();
-        session.heartbeat_at(base).unwrap();
-        let expired = base + std::time::Duration::from_millis(1_001);
-        assert!(session.is_lease_expired_at(expired));
-        assert!(matches!(
-            session.heartbeat_at(expired),
-            Err(NativeBridgeSessionError::LeaseExpired)
-        ));
-        assert!(matches!(
-            session.write_at(expired, &[0.0; 4]),
-            Err(NativeBridgeSessionError::LeaseExpired)
-        ));
-        drop(session);
-        std::fs::remove_file(path).unwrap();
-    }
-
-    /// Review R1 (2026-11-10): once the driver owns the lease, a stall or
-    /// sleep longer than `lease_ms` must not end the route on the client's
-    /// own clock. The driver's HEARTBEAT decides (it renews an owner's
-    /// expired lease no rival reclaimed); without this, every such stall
-    /// forced a 1/2/4 s reconnect even with a 0.2.5 driver.
-    #[test]
-    fn driver_owned_session_survives_a_stall_longer_than_its_lease() {
-        let path = std::env::temp_dir().join(format!(
-            "audiorouter-driver-owned-session-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let hello = audiorouter_protocol::AudioBridgeHello {
-            protocol_major: audiorouter_protocol::AUDIO_BRIDGE_PROTOCOL_MAJOR,
-            protocol_minor: audiorouter_protocol::AUDIO_BRIDGE_PROTOCOL_MINOR,
-            bus_id: "bus-main".to_owned(),
-            direction: audiorouter_protocol::AudioBridgeDirection::CaptureSink,
-            generation: 10,
-            sample_rate_hz: 48_000,
-            channels: 2,
-            frames_per_quantum: 4,
-            lease_ms: 1_000,
-        };
-        let mut session = NativeBridgeSession::create(&path, hello).unwrap();
-        session.defer_lease_to_driver();
-        let base = std::time::Instant::now();
-        session.heartbeat_at(base).unwrap();
-        let stalled = base + std::time::Duration::from_secs(30);
-        assert!(!session.is_lease_expired_at(stalled));
-        session.write_at(stalled, &[0.0; 8]).unwrap();
-        session.heartbeat_at(stalled).unwrap();
-        drop(session);
-        std::fs::remove_file(path).unwrap();
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn native_bridge_control_request_matches_bounded_driver_layout() {
-        let hello = audiorouter_protocol::AudioBridgeHello {
-            protocol_major: audiorouter_protocol::AUDIO_BRIDGE_PROTOCOL_MAJOR,
-            protocol_minor: audiorouter_protocol::AUDIO_BRIDGE_PROTOCOL_MINOR,
-            bus_id: "cable-a".to_owned(),
-            direction: audiorouter_protocol::AudioBridgeDirection::CaptureSink,
-            generation: 11,
-            sample_rate_hz: 48_000,
-            channels: 2,
-            frames_per_quantum: 128,
-            lease_ms: 1_000,
-        };
-        let request = native_bridge_open_request(&hello, 0, 0).unwrap();
-        assert_eq!(std::mem::size_of::<NativeBridgeOpenRequest>(), 176);
-        assert_eq!(request.protocol_major, NATIVE_DRIVER_BRIDGE_PROTOCOL_MAJOR);
-        assert_eq!(request.protocol_minor, NATIVE_DRIVER_BRIDGE_PROTOCOL_MINOR);
-        assert_eq!(request.bus_id_bytes, 14);
-        assert_eq!(
-            &request.bus_id[..7],
-            "cable-a".encode_utf16().collect::<Vec<_>>()
-        );
-        assert_eq!(request.generation, 11);
-        assert_eq!(request.direction, 2);
-        let mut render_hello = hello.clone();
-        render_hello.direction = audiorouter_protocol::AudioBridgeDirection::RenderSource;
-        assert_eq!(
-            native_bridge_open_request(&render_hello, 0, 0)
-                .unwrap()
-                .direction,
-            1
-        );
-        assert!(native_bridge_open_request(
-            &audiorouter_protocol::AudioBridgeHello {
-                bus_id: "cable-i".to_owned(),
-                ..hello.clone()
-            },
-            0,
-            0,
-        )
-        .is_err());
-        assert!(native_bridge_open_request(&hello, 1, 127).is_err());
-        assert!(native_bridge_open_request(&hello, 1, 128).is_ok());
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn native_bridge_duplex_rejects_mismatched_directions_before_device_open() {
-        let render = audiorouter_protocol::AudioBridgeHello {
-            protocol_major: audiorouter_protocol::AUDIO_BRIDGE_PROTOCOL_MAJOR,
-            protocol_minor: audiorouter_protocol::AUDIO_BRIDGE_PROTOCOL_MINOR,
-            bus_id: "bus-duplex".into(),
-            direction: audiorouter_protocol::AudioBridgeDirection::CaptureSink,
-            generation: 1,
-            sample_rate_hz: 48_000,
-            channels: 2,
-            frames_per_quantum: 128,
-            lease_ms: 1_000,
-        };
-        let capture = render.clone();
-        assert!(matches!(
-            NativeBridgeDuplexController::create(
-                "\\\\.\\AudioRouterVirtualBridge",
-                "C:\\missing-render.slot",
-                "C:\\missing-capture.slot",
-                render,
-                capture,
-            ),
-            Err(NativeBridgeControllerError::InvalidDuplex)
-        ));
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn native_bridge_duplex_rejects_mismatched_bus_before_device_open() {
-        let render = audiorouter_protocol::AudioBridgeHello {
-            protocol_major: audiorouter_protocol::AUDIO_BRIDGE_PROTOCOL_MAJOR,
-            protocol_minor: audiorouter_protocol::AUDIO_BRIDGE_PROTOCOL_MINOR,
-            bus_id: "bus-render".into(),
-            direction: audiorouter_protocol::AudioBridgeDirection::RenderSource,
-            generation: 1,
-            sample_rate_hz: 48_000,
-            channels: 2,
-            frames_per_quantum: 128,
-            lease_ms: 1_000,
-        };
-        let mut capture = render.clone();
-        capture.bus_id = "bus-capture".into();
-        capture.direction = audiorouter_protocol::AudioBridgeDirection::CaptureSink;
-        assert!(matches!(
-            NativeBridgeDuplexController::create(
-                "\\\\.\\AudioRouterVirtualBridge",
-                "C:\\missing-render.slot",
-                "C:\\missing-capture.slot",
-                render,
-                capture,
-            ),
-            Err(NativeBridgeControllerError::InvalidDuplex)
-        ));
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn native_bridge_duplex_binding_rejects_mismatched_generation_before_device_open() {
-        let render = audiorouter_protocol::AudioBridgeHello {
-            protocol_major: audiorouter_protocol::AUDIO_BRIDGE_PROTOCOL_MAJOR,
-            protocol_minor: audiorouter_protocol::AUDIO_BRIDGE_PROTOCOL_MINOR,
-            bus_id: "bus-generation".into(),
-            direction: audiorouter_protocol::AudioBridgeDirection::RenderSource,
-            generation: 4,
-            sample_rate_hz: 48_000,
-            channels: 2,
-            frames_per_quantum: 128,
-            lease_ms: 1_000,
-        };
-        let mut capture = render.clone();
-        capture.direction = audiorouter_protocol::AudioBridgeDirection::CaptureSink;
-        capture.generation = 5;
-        assert!(matches!(
-            NativeBridgeDuplexBinding::create(
-                "\\\\.\\AudioRouterVirtualBridge",
-                "C:\\missing-render.slot",
-                "C:\\missing-capture.slot",
-                render,
-                capture,
-            ),
-            Err(NativeBridgeControllerError::InvalidDuplex)
-        ));
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn native_bridge_duplex_rejects_mismatched_shape_before_device_open() {
-        let render = audiorouter_protocol::AudioBridgeHello {
-            protocol_major: audiorouter_protocol::AUDIO_BRIDGE_PROTOCOL_MAJOR,
-            protocol_minor: audiorouter_protocol::AUDIO_BRIDGE_PROTOCOL_MINOR,
-            bus_id: "bus-shape".into(),
-            direction: audiorouter_protocol::AudioBridgeDirection::RenderSource,
-            generation: 4,
-            sample_rate_hz: 48_000,
-            channels: 2,
-            frames_per_quantum: 128,
-            lease_ms: 1_000,
-        };
-        let mut capture = render.clone();
-        capture.direction = audiorouter_protocol::AudioBridgeDirection::CaptureSink;
-        capture.channels = 1;
-        assert!(matches!(
-            NativeBridgeDuplexController::create(
-                "\\\\.\\AudioRouterVirtualBridge",
-                "C:\\missing-render.slot",
-                "C:\\missing-capture.slot",
-                render,
-                capture,
-            ),
-            Err(NativeBridgeControllerError::InvalidDuplex)
-        ));
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn native_bridge_section_handle_uses_only_the_temporary_bridge_file() {
-        let path = std::env::temp_dir().join(format!(
-            "audiorouter-section-{}-{}.slot",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let region = NativeBridgeRegion::create(&path, 2, 128).unwrap();
-        let mapping_bytes = region.mapping_bytes();
-        let section = NativeBridgeSectionHandle::for_file(&path, mapping_bytes as u32).unwrap();
-        assert_ne!(section.raw_handle(), 0);
-        assert_eq!(section.mapping_bytes(), mapping_bytes as u32);
-        region.write(12, 1, &[0.25, -0.25, 0.5, -0.5]).unwrap();
-        let generation = section.read_bytes(8, 8).unwrap();
-        assert_eq!(generation, 12_u64.to_le_bytes());
-        drop(section);
-        drop(region);
-        std::fs::remove_file(path).unwrap();
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn native_bridge_section_handle_rejects_a_nonregular_leaf_before_opening() {
-        let path = std::env::temp_dir().join(format!(
-            "audiorouter-section-directory-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir(&path).unwrap();
-        let result = NativeBridgeSectionHandle::for_file(&path, 4096);
-        assert!(result.is_err());
-        std::fs::remove_dir(path).unwrap();
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn native_bridge_section_handle_rejects_an_undersized_file_before_mapping() {
-        let path = std::env::temp_dir().join(format!(
-            "audiorouter-section-small-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::write(&path, [0_u8; 1]).unwrap();
-        let result = NativeBridgeSectionHandle::for_file(&path, 4096);
-        assert!(result.is_err());
-        std::fs::remove_file(path).unwrap();
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn opening_an_unknown_render_endpoint_fails_without_starting_audio() {
-        let error = SharedRender::open("audiorouter-missing-endpoint", 1_000_000);
-        assert!(matches!(error, Err(AudioError::Windows(_))));
-    }
-
-    #[cfg(windows)]
-    #[test]
-    #[ignore = "needs audio devices; hosted CI runners have none"]
-    fn active_endpoint_enumeration_is_read_only() {
-        let endpoints = enumerate_active_endpoints().unwrap();
-        assert!(!endpoints.is_empty());
-        assert!(endpoints.iter().all(|endpoint| !endpoint.id.is_empty()));
-        assert!(endpoints.iter().all(|endpoint| endpoint.sample_rate_hz > 0));
-    }
-
-    /// Each walk copied every `GetId` string without freeing it: ~150 bytes
-    /// per endpoint per walk, ~9 MiB/h while playing (2026-10-15 app soak).
-    #[cfg(windows)]
-    #[test]
-    #[ignore = "needs audio devices; hosted CI runners have none"]
-    fn endpoint_walks_free_every_endpoint_id() {
-        use windows::Win32::System::Memory::{GetProcessHeap, HeapSummary, HEAP_SUMMARY};
-        fn heap_allocated() -> usize {
-            let mut summary = HEAP_SUMMARY {
-                cb: std::mem::size_of::<HEAP_SUMMARY>() as u32,
-                ..Default::default()
-            };
-            // SAFETY: the process heap handle is valid for the process
-            // lifetime; `summary` is a live local with `cb` set.
-            unsafe { HeapSummary(GetProcessHeap().unwrap(), 0, &mut summary).unwrap() };
-            summary.cbAllocated
-        }
-        let walk = || {
-            enumerate_active_endpoints().unwrap();
-            enumerate_default_endpoint_bindings().unwrap();
-            enumerate_active_endpoint_display_info().unwrap();
-            enumerate_endpoint_states().unwrap();
-        };
-        let endpoints = enumerate_endpoint_states().unwrap().len();
-        assert!(endpoints > 0);
-        for _ in 0..20 {
-            walk();
-        }
-        let walks = 500;
-        let before = heap_allocated();
-        for _ in 0..walks {
-            walk();
-        }
-        let grown = heap_allocated().saturating_sub(before);
-        let per_endpoint = grown / (walks * endpoints);
-        assert!(
-            per_endpoint < 16,
-            "{grown} bytes stayed allocated after {walks} walks of {endpoints} endpoints"
-        );
-    }
-
-    #[cfg(windows)]
-    #[test]
-    #[ignore = "needs audio devices; hosted CI runners have none"]
-    fn endpoint_monitor_starts_with_snapshot_and_no_pending_changes() {
-        let mut monitor = EndpointMonitor::start().unwrap();
-        assert!(!monitor.snapshot().is_empty());
-        assert!(monitor.poll_changes().unwrap().is_empty());
-    }
-}
+... [truncated for diff preview]

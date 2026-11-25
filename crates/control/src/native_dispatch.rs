@@ -727,6 +727,7 @@ impl ControlPlane {
                     NativeMultiInputSourceBinding::Physical(endpoint)
                 }
                 NodeKind::NetworkReceive => NativeMultiInputSourceBinding::Network(node),
+                NodeKind::ApplicationGroup => NativeMultiInputSourceBinding::ApplicationGroup(node),
                 NodeKind::ApplicationCapture => {
                     let process_id = node
                         .parameters

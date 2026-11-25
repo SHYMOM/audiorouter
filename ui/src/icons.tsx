@@ -32,6 +32,7 @@ export function Icon({ name, size = 16, className }: { name: IconName; size?: nu
 export const NODE_KIND_ICONS: Record<NodeKind, IconName> = {
   physicalInput: "mic",
   applicationCapture: "app-window",
+  applicationGroup: "app-window",
   endpointLoopback: "repeat",
   physicalOutput: "speaker",
   virtualRenderSource: "cable",

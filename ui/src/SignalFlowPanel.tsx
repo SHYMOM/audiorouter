@@ -82,8 +82,8 @@ export function SignalFlowPanel({
   setApplicationPickerSelection: Dispatch<SetStateAction<string>>;
   addApplicationCaptureFromPicker: (application: ApplicationRow) => void;
   addApplicationCapturePathFromPicker: (path: string) => string | null;
-  /** Returns whether the group was added (the picker then starts empty next time). */
-  addApplicationGroupFromPicker: (applications: ApplicationRow[], executablePaths: string[]) => boolean;
+  /** Returns null when the group was added, or an error message when refused. */
+  addApplicationGroupFromPicker: (applications: ApplicationRow[], executablePaths: string[]) => string | null;
 }) {
   const tr = useMessages();
   const [applicationMode, setApplicationMode] = useState<"single" | "group">("single");
@@ -401,75 +401,80 @@ export function SignalFlowPanel({
                   <p className="muted" role="status">
                     {tr("g5.appInventoryError", { error: applicationsError })}
                   </p>
-                ) : capturable.length === 0 ? (
-                  <p className="muted" role="status">
-                    {tr("signalFlowDialogs.noRunningApps")}
-                  </p>
                 ) : (
                   <>
-                    {applicationMode === "single" ? (
-                      <>
-                        <label>
-                          {tr("signalFlowDialogs.runningApplication")}
-                          <select
-                            aria-label={tr("g5.appSelectAria")}
-                            value={selected ? applicationKey(selected) : ""}
-                            onChange={(event) => setApplicationPickerSelection(event.target.value)}
-                          >
-                            <ApplicationChoiceOptions applications={applications} />
-                          </select>
-                        </label>
-                        {selected && (
-                          <p className="muted" role="status">
-                            {selected.executable} ·{" "}
-                            {selected.audioSessionCount > 0
-                              ? tr("signalFlowDialogs.audioActive")
-                              : tr("signalFlowDialogs.noAudioYet")}
-                          </p>
-                        )}
-                        <div className="actions">
-                          <button
-                            type="button"
-                            className="primary"
-                            onClick={() => selected && addApplicationCaptureFromPicker(selected)}
-                            disabled={!backend.connected || !selected}
-                          >
-                            {tr("signalFlowDialogs.addRunningApp")}
-                          </button>
-                        </div>
-                      </>
-                    ) : (
-                      <fieldset className="application-group-options" disabled={!backend.connected}>
-                        <legend>{tr("signalFlowDialogs.groupLegend")}</legend>
-                        {capturable.map((application) => {
-                          const key = applicationKey(application);
-                          return (
-                            <label key={key} className="checkbox-row">
-                              <input
-                                type="checkbox"
-                                checked={groupApplicationKeys.includes(key)}
-                                onChange={(event) =>
-                                  setGroupApplicationKeys((keys) =>
-                                    event.target.checked ? [...keys, key] : keys.filter((item) => item !== key),
-                                  )
-                                }
-                              />
-                              <span>{applicationChoiceLabel(application)}</span>
-                            </label>
-                          );
-                        })}
-                        {groupExecutablePaths.map((path) => (
-                          <label key={path.toLocaleLowerCase()} className="checkbox-row">
-                            <input
-                              type="checkbox"
-                              checked
-                              onChange={() => setGroupExecutablePaths((paths) => paths.filter((item) => item !== path))}
-                            />
-                            <span>{path}</span>
-                          </label>
-                        ))}
-                      </fieldset>
+                    {capturable.length === 0 && (
+                      <p className="muted" role="status">
+                        {tr("signalFlowDialogs.noRunningApps")}
+                      </p>
                     )}
+                    {applicationMode === "single"
+                      ? capturable.length > 0 && (
+                          <>
+                            <label>
+                              {tr("signalFlowDialogs.runningApplication")}
+                              <select
+                                aria-label={tr("g5.appSelectAria")}
+                                value={selected ? applicationKey(selected) : ""}
+                                onChange={(event) => setApplicationPickerSelection(event.target.value)}
+                              >
+                                <ApplicationChoiceOptions applications={applications} />
+                              </select>
+                            </label>
+                            {selected && (
+                              <p className="muted" role="status">
+                                {selected.executable} ·{" "}
+                                {selected.audioSessionCount > 0
+                                  ? tr("signalFlowDialogs.audioActive")
+                                  : tr("signalFlowDialogs.noAudioYet")}
+                              </p>
+                            )}
+                            <div className="actions">
+                              <button
+                                type="button"
+                                className="primary"
+                                onClick={() => selected && addApplicationCaptureFromPicker(selected)}
+                                disabled={!backend.connected || !selected}
+                              >
+                                {tr("signalFlowDialogs.addRunningApp")}
+                              </button>
+                            </div>
+                          </>
+                        )
+                      : (capturable.length > 0 || groupExecutablePaths.length > 0) && (
+                          <fieldset className="application-group-options" disabled={!backend.connected}>
+                            <legend>{tr("signalFlowDialogs.groupLegend")}</legend>
+                            {capturable.map((application) => {
+                              const key = applicationKey(application);
+                              return (
+                                <label key={key} className="checkbox-row">
+                                  <input
+                                    type="checkbox"
+                                    checked={groupApplicationKeys.includes(key)}
+                                    onChange={(event) =>
+                                      setGroupApplicationKeys((keys) =>
+                                        event.target.checked ? [...keys, key] : keys.filter((item) => item !== key),
+                                      )
+                                    }
+                                  />
+                                  <span>{applicationChoiceLabel(application)}</span>
+                                </label>
+                              );
+                            })}
+                            {groupExecutablePaths.map((path) => (
+                              <label key={path.toLocaleLowerCase()} className="checkbox-row">
+                                <input
+                                  type="checkbox"
+                                  checked
+                                  onChange={() =>
+                                    setGroupExecutablePaths((paths) => paths.filter((item) => item !== path))
+                                  }
+                                />
+                                <span>{path}</span>
+                              </label>
+                            ))}
+                          </fieldset>
+                        )}
                   </>
                 )}
                 {applicationMode === "group" && (
@@ -481,9 +486,13 @@ export function SignalFlowPanel({
                       const chosen = capturable.filter((application) =>
                         groupApplicationKeys.includes(applicationKey(application)),
                       );
-                      if (addApplicationGroupFromPicker(chosen, groupExecutablePaths)) {
+                      const problem = addApplicationGroupFromPicker(chosen, groupExecutablePaths);
+                      if (problem === null) {
                         setGroupApplicationKeys([]);
                         setGroupExecutablePaths([]);
+                        setPickerMessage("");
+                      } else {
+                        setPickerMessage(problem);
                       }
                     }}
                   >

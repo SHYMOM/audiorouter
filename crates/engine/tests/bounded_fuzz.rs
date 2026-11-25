@@ -263,6 +263,7 @@ fn is_source(kind: NodeKind) -> bool {
     match kind {
         NodeKind::PhysicalInput
         | NodeKind::ApplicationCapture
+        | NodeKind::ApplicationGroup
         | NodeKind::EndpointLoopback
         | NodeKind::VirtualRenderSource
         | NodeKind::TestSignal
@@ -307,6 +308,7 @@ fn is_sink(kind: NodeKind) -> bool {
         NodeKind::PhysicalOutput | NodeKind::VirtualCaptureSink | NodeKind::NetworkSend => true,
         NodeKind::PhysicalInput
         | NodeKind::ApplicationCapture
+        | NodeKind::ApplicationGroup
         | NodeKind::EndpointLoopback
         | NodeKind::VirtualRenderSource
         | NodeKind::TestSignal

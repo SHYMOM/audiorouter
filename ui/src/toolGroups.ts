@@ -12,6 +12,7 @@ export type ShelfGroupId = ToolGroupId | "canvas" | "setup";
 export const TOOL_GROUP_OF: Record<NodeKind, ToolGroupId> = {
   physicalInput: "input",
   applicationCapture: "input",
+  applicationGroup: "input",
   audioFile: "input",
   soundboard: "input",
   instrument: "input",

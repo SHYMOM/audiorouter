@@ -353,5 +353,6 @@ export function toolKindLabel(kind: string): string {
   const entry = libraryEntries.find((item) => (item.kind ?? item.virtualKind) === kind);
   if (entry) return toolLabel(entry);
   if (kind === "applicationCapture") return tx("toolShelf.application");
+  if (kind === "applicationGroup") return tx("signalFlowDialogs.appGroup");
   return kind;
 }

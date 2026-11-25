@@ -273,6 +273,9 @@ impl ControlPlane {
                 { "name": "processId", "type": "number", "step": 1.0, "minimum": 1.0, "maximum": f64::from(u32::MAX), "description": "Process ID from apps.list; only with processPolicy selectedInstance." },
                 { "name": "creationTime100ns", "type": "string", "description": "Opaque process start time from apps.list (a decimal string); only with processPolicy selectedInstance." }
             ]),
+            audiorouter_domain::NodeKind::ApplicationGroup => json!([
+                { "name": "applications", "type": "array", "maxItems": audiorouter_domain::MAX_APPLICATION_GROUP_MEMBERS, "description": "Required. Applications captured together into one stereo source (1 to 32 entries); each entry has executable and optional executablePath." }
+            ]),
             audiorouter_domain::NodeKind::EndpointLoopback => json!([
                 { "name": "endpointId", "type": "string", "maxLength": audiorouter_domain::MAX_ENTITY_ID_BYTES, "description": "Render device ID from devices.list whose output is captured. Give exactly one of endpointId and defaultRole." },
                 { "name": "defaultRole", "type": "string", "enum": ["console", "multimedia", "communications"], "description": "Follow the Windows default output of this role instead of a fixed device. Give exactly one of endpointId and defaultRole." }

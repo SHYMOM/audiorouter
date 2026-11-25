@@ -1616,6 +1616,7 @@ export const MESSAGE_KEYS = [
   "g4Canvas.jumpForwardTitle",
   "g4Canvas.jumpLive",
   "g4Canvas.kindApplicationCapture",
+  "g4Canvas.kindApplicationGroup",
   "g4Canvas.kindAudioFile",
   "g4Canvas.kindBassTreble",
   "g4Canvas.kindCompressor",

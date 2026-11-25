@@ -3,7 +3,15 @@ import { useContext, useEffect, useRef, useState } from "react";
 import type { Node, NodeKind, PluginParametersResult } from "@audiorouter/contracts";
 import { formatUiError, type ApplicationRow, type UiBackend } from "./backend";
 import type { DeviceListItem } from "@audiorouter/contracts";
-import { applicationCaptureChoices, applicationChoiceKey, mixerInputs, mixerInputVolumeKey } from "./draft";
+import {
+  applicationCaptureChoices,
+  applicationChoiceKey,
+  applicationExecutableSelector,
+  applicationGroupEntries,
+  mixerInputs,
+  mixerInputVolumeKey,
+  type ApplicationGroupEntry,
+} from "./draft";
 import { audioUploadProblem, uploadAudioMedia } from "./audioUpload";
 import { optionLabel, parameterText } from "./parameterText";
 import { LiveLevelBar } from "./ToolVisuals";
@@ -33,6 +41,7 @@ import type { MessageKey } from "./i18n/generated/messageKeys";
 export const GENERIC_SETTINGS_EDITOR: Record<NodeKind, boolean> = {
   physicalInput: false,
   applicationCapture: false,
+  applicationGroup: false,
   endpointLoopback: false,
   physicalOutput: false,
   virtualRenderSource: false,
@@ -773,6 +782,186 @@ export function ApplicationCaptureBinding({
       <button type="button" className="secondary" onClick={onRefresh} disabled={disabled}>
         {tr("g5.appRefresh")}
       </button>
+    </div>
+  );
+}
+
+/** Editable list of applications grouped into one `applicationGroup` source node. */
+export function ApplicationGroupEditor({
+  node,
+  applications,
+  error,
+  disabled,
+  onRefresh,
+  onChange,
+}: {
+  node: Node;
+  applications: ApplicationRow[];
+  error: string | null;
+  disabled: boolean;
+  onRefresh: () => void;
+  onChange: (entries: ApplicationGroupEntry[]) => void;
+}) {
+  const tr = useMessages();
+  const entries = applicationGroupEntries(node);
+  const choices = applicationCaptureChoices(applications);
+  const capturable = [...choices.withAudio, ...choices.other];
+  const [selectedKeys, setSelectedKeys] = useState<string[]>([]);
+  const [executablePath, setExecutablePath] = useState("");
+  const [editorMessage, setEditorMessage] = useState("");
+
+  const entryKey = (entry: ApplicationGroupEntry) => (entry.executablePath ?? entry.executable).toLowerCase();
+  const existingKeys = new Set(entries.map(entryKey));
+  const availableToAdd = capturable.filter((application) => {
+    const key = (application.executablePath ?? application.executable).toLowerCase();
+    return !existingKeys.has(key);
+  });
+
+  const addSelectedRunning = () => {
+    const chosen = availableToAdd.filter((application) => selectedKeys.includes(applicationChoiceKey(application)));
+    if (chosen.length === 0) return;
+    const additions: ApplicationGroupEntry[] = [];
+    for (const application of chosen) {
+      if (!application.executablePath) {
+        setEditorMessage(tr("draftErrors.exePathUnavailable", { name: application.executable }));
+        return;
+      }
+      const selector = applicationExecutableSelector(application.executablePath);
+      const nextEntry: ApplicationGroupEntry = {
+        executable: selector.executable,
+        executablePath: selector.executablePath,
+      };
+      if (!existingKeys.has(entryKey(nextEntry))) {
+        additions.push(nextEntry);
+      }
+    }
+    setEditorMessage("");
+    setSelectedKeys([]);
+    if (additions.length > 0) {
+      onChange([...entries, ...additions]);
+    }
+  };
+
+  const addPath = () => {
+    const trimmed = executablePath.trim();
+    if (!trimmed) {
+      setEditorMessage(tr("signalFlowDialogs.pathFirst"));
+      return;
+    }
+    try {
+      const selector = applicationExecutableSelector(trimmed);
+      const nextEntry: ApplicationGroupEntry = {
+        executable: selector.executable,
+        executablePath: selector.executablePath,
+      };
+      if (!entries.some((item) => entryKey(item) === entryKey(nextEntry))) {
+        onChange([...entries, nextEntry]);
+      }
+      setExecutablePath("");
+      setEditorMessage("");
+    } catch (err) {
+      setEditorMessage(err instanceof Error ? err.message : tr("signalFlowDialogs.pickerFailed"));
+    }
+  };
+
+  return (
+    <div className="node-binding-editor" aria-label={tr("signalFlowDialogs.appGroup")}>
+      <div>
+        <p className="eyebrow">{tr("signalFlowDialogs.appGroup")}</p>
+        <strong>{`${entries.length} ${entries.length === 1 ? "application" : "applications"}`}</strong>
+      </div>
+      <div className="application-group-options" role="list">
+        {entries.map((entry) => (
+          <div key={entryKey(entry)} className="app-group-member-row" role="listitem">
+            <span title={entry.executablePath ?? entry.executable}>{entry.executable}</span>
+            <button
+              type="button"
+              className="secondary"
+              disabled={disabled || entries.length <= 1}
+              aria-label={`Remove ${entry.executable}`}
+              onClick={() => onChange(entries.filter((item) => entryKey(item) !== entryKey(entry)))}
+            >
+              Remove
+            </button>
+          </div>
+        ))}
+      </div>
+      {availableToAdd.length > 0 && (
+        <>
+          <fieldset className="application-group-options" disabled={disabled}>
+            <legend>Add running applications</legend>
+            {availableToAdd.map((application) => {
+              const key = applicationChoiceKey(application);
+              return (
+                <label key={key} className="checkbox-row">
+                  <input
+                    type="checkbox"
+                    checked={selectedKeys.includes(key)}
+                    onChange={(event) =>
+                      setSelectedKeys((keys) =>
+                        event.target.checked ? [...keys, key] : keys.filter((item) => item !== key),
+                      )
+                    }
+                  />
+                  <span>{applicationChoiceLabel(application)}</span>
+                </label>
+              );
+            })}
+          </fieldset>
+          <div className="actions">
+            <button
+              type="button"
+              className="primary"
+              disabled={disabled || selectedKeys.length === 0}
+              onClick={addSelectedRunning}
+            >
+              {selectedKeys.length > 0 ? `Add selected (${selectedKeys.length})` : "Add selected"}
+            </button>
+          </div>
+        </>
+      )}
+      <label>
+        {tr("signalFlowDialogs.exePathLabel")}
+        <input
+          aria-label={tr("signalFlowDialogs.exePathLabel")}
+          value={executablePath}
+          placeholder="C:\Games\game.exe"
+          disabled={disabled}
+          onChange={(event) => setExecutablePath(event.target.value)}
+        />
+      </label>
+      <div className="actions">
+        <button
+          type="button"
+          className="secondary"
+          disabled={disabled}
+          onClick={async () => {
+            const invoke = window.__TAURI_INTERNALS__?.invoke;
+            if (!invoke) {
+              setEditorMessage(tr("signalFlowDialogs.typePath"));
+              return;
+            }
+            try {
+              const path = await invoke("choose_application_executable");
+              if (typeof path === "string" && path) setExecutablePath(path);
+              setEditorMessage("");
+            } catch (err) {
+              setEditorMessage(err instanceof Error ? err.message : tr("signalFlowDialogs.pickerFailed"));
+            }
+          }}
+        >
+          {tr("signalFlowDialogs.browseExe")}
+        </button>
+        <button type="button" className="secondary" disabled={disabled} onClick={addPath}>
+          {tr("signalFlowDialogs.addPathToGroup")}
+        </button>
+        <button type="button" className="secondary" onClick={onRefresh} disabled={disabled}>
+          {tr("g5.appRefresh")}
+        </button>
+      </div>
+      {(editorMessage || error || disabled) && (
+        <small>{editorMessage || (error ? tr("g5.appInventoryError", { error }) : tr("g5.appStopSession"))}</small>
+      )}
     </div>
   );
 }

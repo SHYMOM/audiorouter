@@ -34,6 +34,7 @@ fn takes_presets(kind: NodeKind) -> bool {
         NodeKind::PhysicalInput
         | NodeKind::PhysicalOutput
         | NodeKind::ApplicationCapture
+        | NodeKind::ApplicationGroup
         | NodeKind::EndpointLoopback
         | NodeKind::VirtualRenderSource
         | NodeKind::VirtualCaptureSink

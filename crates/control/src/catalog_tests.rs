@@ -73,9 +73,18 @@ fn describe_exposes_versions_methods_limits_and_unavailable_nodes() {
             "system.describe events field {field} missing from response"
         );
     }
-    assert_eq!(description["limits"]["maxNodesPerSession"], 64);
-    assert_eq!(description["limits"]["maxNodesGlobal"], 128);
-    assert_eq!(description["limits"]["maxEdgesGlobal"], 256);
+    assert_eq!(
+        description["limits"]["maxNodesPerSession"],
+        audiorouter_domain::MAX_NODES_PER_SESSION
+    );
+    assert_eq!(
+        description["limits"]["maxNodesGlobal"],
+        audiorouter_domain::MAX_NODES_GLOBAL
+    );
+    assert_eq!(
+        description["limits"]["maxEdgesGlobal"],
+        audiorouter_domain::MAX_EDGES_GLOBAL
+    );
     assert_eq!(
         description["limits"]["maxSessionsGlobal"],
         audiorouter_domain::MAX_SESSIONS_GLOBAL
@@ -146,8 +155,14 @@ fn describe_exposes_versions_methods_limits_and_unavailable_nodes() {
         .unwrap();
     let session_schema = &create["outputSchema"]["properties"]["session"];
     assert_eq!(session_schema["properties"]["name"]["maxLength"], 256);
-    assert_eq!(session_schema["properties"]["nodes"]["maxItems"], 64);
-    assert_eq!(session_schema["properties"]["edges"]["maxItems"], 128);
+    assert_eq!(
+        session_schema["properties"]["nodes"]["maxItems"],
+        audiorouter_domain::MAX_NODES_PER_SESSION
+    );
+    assert_eq!(
+        session_schema["properties"]["edges"]["maxItems"],
+        audiorouter_domain::MAX_EDGES_PER_SESSION
+    );
     let node_schema = &session_schema["properties"]["nodes"]["items"];
     assert_eq!(node_schema["properties"]["ports"]["maxItems"], 16);
     assert_eq!(
@@ -180,7 +195,7 @@ fn describe_exposes_versions_methods_limits_and_unavailable_nodes() {
         .unwrap();
     assert_eq!(
         create_input["inputSchema"]["properties"]["session"]["properties"]["nodes"]["maxItems"],
-        64
+        audiorouter_domain::MAX_NODES_PER_SESSION
     );
     let import_input = description["methods"]
         .as_array()
@@ -190,7 +205,7 @@ fn describe_exposes_versions_methods_limits_and_unavailable_nodes() {
         .unwrap();
     assert_eq!(
         import_input["inputSchema"]["properties"]["session"]["properties"]["edges"]["maxItems"],
-        128
+        audiorouter_domain::MAX_EDGES_PER_SESSION
     );
     let graph_plan_input = description["methods"]
         .as_array()
@@ -201,7 +216,7 @@ fn describe_exposes_versions_methods_limits_and_unavailable_nodes() {
     assert_eq!(
         graph_plan_input["inputSchema"]["properties"]["candidate"]["properties"]["nodes"]
             ["maxItems"],
-        64
+        audiorouter_domain::MAX_NODES_PER_SESSION
     );
     let graph_plan = description["methods"]
         .as_array()
@@ -1318,12 +1333,12 @@ fn has_no_settings(kind: audiorouter_domain::NodeKind) -> bool {
         // Plugin settings are per plugin (`pluginParameter:<id>`), listed by
         // plugins.parameters for the loaded plugin; the kind lists only
         // AudioRouter's own `passThroughAllowed` guard.
-        PhysicalInput | ApplicationCapture | EndpointLoopback | PhysicalOutput | Plugin
-        | VirtualRenderSource | VirtualCaptureSink | TestSignal | Mixer | Gain | Mute
-        | ParametricEq | Compressor | Gate | Limiter | Delay | GraphicEq | Pitch | Recorder
-        | AudioFile | Soundboard | Volume | BassTreble | Dehum | Declick | InputSwitch
-        | OutputSwitch | Denoise | SpeechDenoise | FirFilter | SpectralGate | TimeShift
-        | NetworkSend | NetworkReceive | Duck | FunVoiceChanger | Instrument => false,
+        PhysicalInput | ApplicationCapture | ApplicationGroup | EndpointLoopback
+        | PhysicalOutput | Plugin | VirtualRenderSource | VirtualCaptureSink | TestSignal
+        | Mixer | Gain | Mute | ParametricEq | Compressor | Gate | Limiter | Delay | GraphicEq
+        | Pitch | Recorder | AudioFile | Soundboard | Volume | BassTreble | Dehum | Declick
+        | InputSwitch | OutputSwitch | Denoise | SpeechDenoise | FirFilter | SpectralGate
+        | TimeShift | NetworkSend | NetworkReceive | Duck | FunVoiceChanger | Instrument => false,
     }
 }
 
@@ -1388,6 +1403,9 @@ fn representative_value(name: &str, parameter: &Value) -> Value {
             "host" | "sender" => json!("192.168.1.20"),
             "pairingKey" => json!("0123456789abcdef"),
             "creationTime100ns" => json!("133000000000000000"),
+            "applications" => {
+                json!([{ "executable": "Discord.exe", "executablePath": "C:\\Apps\\Discord.exe" }])
+            }
             _ => json!("value-1"),
         },
     }
@@ -1402,6 +1420,9 @@ fn base_parameters(kind: audiorouter_domain::NodeKind) -> Value {
             "processPolicy": "selectedInstance",
             "processId": 42,
             "creationTime100ns": "133000000000000000"
+        }),
+        audiorouter_domain::NodeKind::ApplicationGroup => json!({
+            "applications": [{ "executable": "Discord.exe", "executablePath": "C:\\Apps\\Discord.exe" }]
         }),
         _ => json!({}),
     }

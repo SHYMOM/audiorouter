@@ -2495,7 +2495,7 @@ pub(crate) fn parameter_descriptor_schema() -> Value {
         "type": "object",
         "properties": {
             "name": { "type": "string", "minLength": 1 },
-            "type": { "enum": ["boolean", "number", "string"] },
+            "type": { "enum": ["boolean", "number", "string", "array"] },
             "unit": { "type": "string", "minLength": 1 },
             "step": { "type": "number", "exclusiveMinimum": 0 },
             "minimum": { "type": "number" },

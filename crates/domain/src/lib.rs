@@ -10,11 +10,11 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
-pub const MAX_NODES_PER_SESSION: usize = 64;
-pub const MAX_EDGES_PER_SESSION: usize = 128;
+pub const MAX_NODES_PER_SESSION: usize = 256;
+pub const MAX_EDGES_PER_SESSION: usize = 512;
 pub const CURRENT_SESSION_SCHEMA_VERSION: u32 = 1;
-pub const MAX_NODES_GLOBAL: usize = 128;
-pub const MAX_EDGES_GLOBAL: usize = 256;
+pub const MAX_NODES_GLOBAL: usize = 512;
+pub const MAX_EDGES_GLOBAL: usize = 1024;
 /// Maximum number of persisted/in-memory session records in one backend.
 /// This prevents empty sessions from bypassing the aggregate node/edge budget.
 pub const MAX_SESSIONS_GLOBAL: usize = 128;
@@ -94,6 +94,7 @@ fn latency_samples_with(kind: NodeKind, parameter: impl Fn(&str) -> Option<f64>)
         NodeKind::FunVoiceChanger => VOICE_CHANGER_LATENCY_SAMPLES,
         NodeKind::PhysicalInput
         | NodeKind::ApplicationCapture
+        | NodeKind::ApplicationGroup
         | NodeKind::EndpointLoopback
         | NodeKind::PhysicalOutput
         | NodeKind::VirtualRenderSource
@@ -171,6 +172,7 @@ impl EntityId {
 pub enum NodeKind {
     PhysicalInput,
     ApplicationCapture,
+    ApplicationGroup,
     EndpointLoopback,
     PhysicalOutput,
     VirtualRenderSource,
@@ -219,9 +221,10 @@ pub enum NodeKind {
 }
 
 impl NodeKind {
-    pub const ALL: [Self; 38] = [
+    pub const ALL: [Self; 39] = [
         Self::PhysicalInput,
         Self::ApplicationCapture,
+        Self::ApplicationGroup,
         Self::EndpointLoopback,
         Self::PhysicalOutput,
         Self::VirtualRenderSource,
@@ -264,6 +267,7 @@ impl NodeKind {
         match self {
             Self::PhysicalInput => "physical-input",
             Self::ApplicationCapture => "application-capture",
+            Self::ApplicationGroup => "application-group",
             Self::EndpointLoopback => "endpoint-loopback",
             Self::PhysicalOutput => "physical-output",
             Self::VirtualRenderSource => "virtual-render-source",
@@ -466,7 +470,34 @@ fn valid_creation_time(value: &serde_json::Value) -> bool {
     })
 }
 
-pub fn node_registry() -> [NodeTypeSpec; 38] {
+pub const MAX_APPLICATION_GROUP_MEMBERS: usize = 32;
+
+fn valid_application_group_list(value: &serde_json::Value) -> bool {
+    let Some(items) = value.as_array() else {
+        return false;
+    };
+    if items.is_empty() || items.len() > MAX_APPLICATION_GROUP_MEMBERS {
+        return false;
+    }
+    items.iter().all(|item| {
+        let Some(map) = item.as_object() else {
+            return false;
+        };
+        let executable_ok = map
+            .get("executable")
+            .is_some_and(|v| valid_bounded_string(v, MAX_APPLICATION_EXECUTABLE_BYTES));
+        let path_ok = match map.get("executablePath") {
+            Some(v) => valid_bounded_string(v, MAX_APPLICATION_PATH_BYTES),
+            None => true,
+        };
+        let only_known_keys = map
+            .keys()
+            .all(|key| key == "executable" || key == "executablePath");
+        executable_ok && path_ok && only_known_keys
+    })
+}
+
+pub fn node_registry() -> [NodeTypeSpec; 39] {
     NodeKind::ALL.map(|kind| NodeTypeSpec {
         kind,
         version: 1,
@@ -504,6 +535,7 @@ pub fn node_registry() -> [NodeTypeSpec; 38] {
             // identity are runtime binding checks, not capability absence.
             NodeKind::PhysicalInput
             | NodeKind::ApplicationCapture
+            | NodeKind::ApplicationGroup
             | NodeKind::EndpointLoopback
             | NodeKind::PhysicalOutput => CapabilityAvailability::Available,
             NodeKind::VirtualRenderSource | NodeKind::VirtualCaptureSink => {
@@ -542,6 +574,7 @@ pub fn node_registry() -> [NodeTypeSpec; 38] {
             NodeKind::Plugin | NodeKind::Instrument => "worker-bound",
             NodeKind::PhysicalInput
             | NodeKind::ApplicationCapture
+            | NodeKind::ApplicationGroup
             | NodeKind::EndpointLoopback
             | NodeKind::PhysicalOutput
             | NodeKind::VirtualRenderSource
@@ -1821,6 +1854,7 @@ impl Node {
             }
             NodeKind::PhysicalInput
             | NodeKind::ApplicationCapture
+            | NodeKind::ApplicationGroup
             | NodeKind::EndpointLoopback
             | NodeKind::PhysicalOutput
             | NodeKind::VirtualRenderSource
@@ -2577,6 +2611,7 @@ pub fn validate_session(session: &Session) -> Result<(), Vec<ValidationError>> {
                 }
                 (NodeKind::ApplicationCapture, "processId") => valid_process_id(value),
                 (NodeKind::ApplicationCapture, "creationTime100ns") => valid_creation_time(value),
+                (NodeKind::ApplicationGroup, "applications") => valid_application_group_list(value),
                 (NodeKind::EndpointLoopback, "endpointId") => {
                     valid_bounded_string(value, MAX_ENTITY_ID_BYTES)
                 }
@@ -2674,6 +2709,17 @@ pub fn validate_session(session: &Session) -> Result<(), Vec<ValidationError>> {
                         });
                     }
                 }
+            }
+        }
+        if node.kind == NodeKind::ApplicationGroup {
+            if !node
+                .parameters
+                .get("applications")
+                .is_some_and(valid_application_group_list)
+            {
+                errors.push(ValidationError::InvalidParameter {
+                    path: format!("{path}.parameters.applications"),
+                });
             }
         }
         if node.kind == NodeKind::EndpointLoopback {
@@ -5063,7 +5109,7 @@ mod tests {
     #[test]
     fn registry_reports_audio_and_processor_capabilities_explicitly() {
         let registry = node_registry();
-        assert_eq!(registry.len(), 38);
+        assert_eq!(registry.len(), NodeKind::ALL.len());
         let voice = registry
             .iter()
             .find(|spec| spec.kind == NodeKind::FunVoiceChanger)
@@ -5570,6 +5616,17 @@ mod tests {
     }
 
     #[test]
+    fn session_accepts_more_than_64_nodes_within_session_limit() {
+        let value = session(
+            (0..70)
+                .map(|index| node(&format!("n-{index}"), NodeKind::Gain, PortDirection::Input))
+                .collect(),
+            vec![],
+        );
+        assert!(validate_session(&value).is_ok());
+    }
+
+    #[test]
     fn global_graph_rejects_empty_bus_ids_and_aggregate_budget_overflow() {
         let mut first = session(
             (0..MAX_NODES_PER_SESSION)
@@ -5610,8 +5667,8 @@ mod tests {
         let errors = validate_global_graph(&[first, second, third], &[route]).unwrap_err();
         assert!(errors.iter().any(|error| matches!(
             error,
-            ValidationError::LimitExceeded { path, requested: 129, maximum: MAX_NODES_GLOBAL }
-                if path == "global.nodes"
+            ValidationError::LimitExceeded { path, requested, maximum: MAX_NODES_GLOBAL }
+                if path == "global.nodes" && *requested == MAX_NODES_GLOBAL + 1
         )));
         assert!(errors.iter().any(|error| matches!(
             error,
@@ -5739,8 +5796,12 @@ mod tests {
             value
         };
         let mut store = GraphStore::default();
-        store.insert_session(make_session("one", 64)).unwrap();
-        store.insert_session(make_session("two", 64)).unwrap();
+        store
+            .insert_session(make_session("one", MAX_NODES_PER_SESSION))
+            .unwrap();
+        store
+            .insert_session(make_session("two", MAX_NODES_PER_SESSION))
+            .unwrap();
         let error = store.insert_session(make_session("three", 1)).unwrap_err();
         assert!(matches!(
             error,
@@ -5795,8 +5856,12 @@ mod tests {
             value
         };
         let mut store = GraphStore::default();
-        store.insert_session(make_session("existing", 64)).unwrap();
-        store.insert_session(make_session("full", 64)).unwrap();
+        store
+            .insert_session(make_session("existing", MAX_NODES_PER_SESSION))
+            .unwrap();
+        store
+            .insert_session(make_session("full", MAX_NODES_PER_SESSION))
+            .unwrap();
         let error = store
             .restore_history(vec![make_session("restored", 1)])
             .unwrap_err();
@@ -5812,7 +5877,7 @@ mod tests {
                 .unwrap()
                 .nodes
                 .len(),
-            64
+            MAX_NODES_PER_SESSION
         );
     }
 
