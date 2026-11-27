@@ -554,40 +554,98 @@ impl ControlPlane {
         Ok(snapshot)
     }
 
-    /// Enumerate processes and their audio sessions (30-100 ms on a real
-    /// PC). Runs on the inventory thread once the backend service starts.
+    /// Enumerate processes, their audio sessions/meters, and installed
+    /// applications/games (30-100 ms on a real PC). Runs on the inventory
+    /// thread once the backend service starts.
     pub(crate) fn build_application_inventory() -> Result<Value, ControlError> {
+        use std::collections::HashSet;
+
         let applications =
             audiorouter_windows_audio::enumerate_applications().map_err(audio_control_error)?;
         let audio = audiorouter_windows_audio::enumerate_application_audio()
             .map_err(audio_control_error)?;
-        Ok(json!(applications
-            .into_iter()
-            .map(|application| {
-                let session = audio.iter().find(|item| item.process_id == application.process_id);
-                json!({
-                    "processId": application.process_id,
-                    "executable": application.executable,
-                    "executablePath": application.executable_path,
-                    "creationTime100ns": application.creation_time_100ns.map(|value| value.to_string()),
-                    "audioActivity": session.map_or("none", |item| if item.active_session_count > 0 { "active" } else { "inactive" }),
-                    "captureCapability": session.map_or("notObserved", |item| if item.capture_session_count > 0 { "observed" } else { "notObserved" }),
-                    "audioSessionCount": session.map_or(0, |item| item.total_session_count),
-                    "activeAudioSessionCount": session.map_or(0, |item| item.active_session_count),
-                    "captureSessionCount": session.map_or(0, |item| item.capture_session_count),
-                    "renderSessionCount": session.map_or(0, |item| item.render_session_count),
-                    "audioDisplayNames": session.map_or_else(Vec::new, |item| item.display_names.clone()),
-                    "audioEndpoints": session.map_or_else(Vec::new, |item| item.endpoints.iter().map(|endpoint| json!({
-                        "deviceId": endpoint.endpoint_id,
-                        "direction": match endpoint.direction {
-                            audiorouter_windows_audio::EndpointDirection::Capture => "capture",
-                            audiorouter_windows_audio::EndpointDirection::Render => "render",
-                        },
-                        "active": endpoint.active,
-                    })).collect()),
-                })
-            })
-            .collect::<Vec<_>>()))
+        let installed = audiorouter_windows_audio::enumerate_installed_applications();
+        let installed_by_path: std::collections::HashMap<
+            String,
+            &audiorouter_windows_audio::InstalledApplicationInfo,
+        > = installed
+            .iter()
+            .map(|item| (item.executable_path.to_ascii_lowercase(), item))
+            .collect();
+
+        let mut running_paths = HashSet::new();
+        let mut items = Vec::with_capacity(applications.len() + installed.len());
+        for application in applications {
+            if let Some(path) = application.executable_path.as_deref() {
+                running_paths.insert(path.to_ascii_lowercase());
+            }
+            let session = audio
+                .iter()
+                .find(|item| item.process_id == application.process_id);
+            let installed_match = application
+                .executable_path
+                .as_deref()
+                .and_then(|p| installed_by_path.get(&p.to_ascii_lowercase()).copied());
+            let display_name = session
+                .and_then(|item| item.display_names.first().cloned())
+                .or_else(|| installed_match.map(|item| item.display_name.clone()));
+            let source = installed_match.map_or("running", |item| item.source);
+            let peak_level = session.map_or(0.0, |item| item.peak_level);
+            items.push(json!({
+                "processId": application.process_id,
+                "executable": application.executable,
+                "executablePath": application.executable_path,
+                "creationTime100ns": application.creation_time_100ns.map(|value| value.to_string()),
+                "running": true,
+                "displayName": display_name,
+                "source": source,
+                "peakLevel": peak_level,
+                "audioActivity": session.map_or("none", |item| if item.active_session_count > 0 || item.peak_level > 0.001 { "active" } else { "inactive" }),
+                "captureCapability": session.map_or("notObserved", |item| if item.capture_session_count > 0 { "observed" } else { "notObserved" }),
+                "audioSessionCount": session.map_or(0, |item| item.total_session_count),
+                "activeAudioSessionCount": session.map_or(0, |item| item.active_session_count),
+                "captureSessionCount": session.map_or(0, |item| item.capture_session_count),
+                "renderSessionCount": session.map_or(0, |item| item.render_session_count),
+                "audioDisplayNames": session.map_or_else(Vec::new, |item| item.display_names.clone()),
+                "audioEndpoints": session.map_or_else(Vec::new, |item| item.endpoints.iter().map(|endpoint| json!({
+                    "deviceId": endpoint.endpoint_id,
+                    "direction": match endpoint.direction {
+                        audiorouter_windows_audio::EndpointDirection::Capture => "capture",
+                        audiorouter_windows_audio::EndpointDirection::Render => "render",
+                    },
+                    "active": endpoint.active,
+                })).collect()),
+            }));
+        }
+
+        for entry in installed {
+            if items.len() >= audiorouter_windows_audio::MAX_APPLICATIONS {
+                break;
+            }
+            if running_paths.contains(&entry.executable_path.to_ascii_lowercase()) {
+                continue;
+            }
+            items.push(json!({
+                "processId": 0,
+                "executable": entry.executable,
+                "executablePath": entry.executable_path,
+                "creationTime100ns": null,
+                "running": false,
+                "displayName": entry.display_name,
+                "source": entry.source,
+                "peakLevel": 0.0,
+                "audioActivity": "none",
+                "captureCapability": "notObserved",
+                "audioSessionCount": 0,
+                "activeAudioSessionCount": 0,
+                "captureSessionCount": 0,
+                "renderSessionCount": 0,
+                "audioDisplayNames": [],
+                "audioEndpoints": [],
+            }));
+        }
+
+        Ok(Value::Array(items))
     }
 
     pub(crate) fn dispatch_processors_response(

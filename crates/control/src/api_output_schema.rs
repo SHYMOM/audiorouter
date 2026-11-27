@@ -829,10 +829,14 @@ fn method_output_schema_impl(name: &str) -> Value {
             "items": {
                 "type": "object",
                 "properties": {
-                    "processId": { "type": "integer", "minimum": 1 },
+                    "processId": { "type": "integer", "minimum": 0 },
                     "executable": { "type": "string", "maxLength": 260 },
                     "executablePath": { "type": ["string", "null"], "maxLength": 32768 },
                     "creationTime100ns": { "type": ["string", "null"] },
+                    "running": { "type": "boolean" },
+                    "displayName": { "type": ["string", "null"], "maxLength": 512 },
+                    "source": { "enum": ["running", "steam", "epic", "installed"] },
+                    "peakLevel": { "type": "number", "minimum": 0.0, "maximum": 1.0 },
                     "audioActivity": { "enum": ["active", "inactive", "none"] },
                     "captureCapability": { "enum": ["observed", "notObserved"] },
                     "audioSessionCount": { "type": "integer", "minimum": 0 },

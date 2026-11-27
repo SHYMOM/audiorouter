@@ -2711,16 +2711,15 @@ pub fn validate_session(session: &Session) -> Result<(), Vec<ValidationError>> {
                 }
             }
         }
-        if node.kind == NodeKind::ApplicationGroup {
-            if !node
+        if node.kind == NodeKind::ApplicationGroup
+            && !node
                 .parameters
                 .get("applications")
                 .is_some_and(valid_application_group_list)
-            {
-                errors.push(ValidationError::InvalidParameter {
-                    path: format!("{path}.parameters.applications"),
-                });
-            }
+        {
+            errors.push(ValidationError::InvalidParameter {
+                path: format!("{path}.parameters.applications"),
+            });
         }
         if node.kind == NodeKind::EndpointLoopback {
             let has_endpoint = node.parameters.contains_key("endpointId");

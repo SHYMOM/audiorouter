@@ -1,11 +1,16 @@
 // The Signal flow panel: canvas, connection form and the connection, plug-in and application dialogs (moved from App.tsx).
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import type { Dispatch, MouseEvent, ReactElement, RefObject, SetStateAction } from "react";
 import type { DiagnosticsSnapshot, Node, PluginScanEntry, Session } from "@audiorouter/contracts";
 import type { ApplicationRow, UiBackend } from "./backend";
 import { applicationCaptureChoices, applicationChoiceKey } from "./draft";
 import { LoadedPluginsPanel, PluginScanPanel } from "./PluginPanels";
-import { ApplicationChoiceOptions, applicationChoiceLabel, duplicateApplicationLabels } from "./NodeEditors";
+import {
+  AppSideMeter,
+  ApplicationChoiceOptions,
+  applicationChoiceLabel,
+  duplicateApplicationLabels,
+} from "./NodeEditors";
 import { AppExeIcon, useApplicationIcons } from "./appIcons";
 
 export function SignalFlowPanel({
@@ -101,6 +106,14 @@ export function SignalFlowPanel({
   const [pickerMessage, setPickerMessage] = useState("");
   /** The typed path was refused: the field says so (aria-invalid) and the status says why. */
   const [pathRefused, setPathRefused] = useState(false);
+
+  useEffect(() => {
+    if (!applicationPickerOpen || !backend.connected) return;
+    const timer = window.setInterval(() => {
+      refreshApplications();
+    }, 650);
+    return () => window.clearInterval(timer);
+  }, [applicationPickerOpen, backend.connected, refreshApplications]);
   return (
     <section id="signal-flow-panel" className="canvas-panel" aria-labelledby="canvas-heading">
       <div className="section-heading">
@@ -463,11 +476,11 @@ export function SignalFlowPanel({
                             <>
                               {capturable.length > 0 && (
                                 <label>
-                                  Search running applications
+                                  Search applications and games
                                   <input
                                     type="search"
                                     value={groupSearchQuery}
-                                    placeholder="Filter by app name (e.g. BloodStrike, Discord)..."
+                                    placeholder="Filter by app or game name (e.g. BloodStrike, FC 26, Discord)..."
                                     onChange={(event) => setGroupSearchQuery(event.target.value)}
                                   />
                                 </label>
@@ -494,6 +507,7 @@ export function SignalFlowPanel({
                                         <AppExeIcon executablePath={application.executablePath} icons={pickerIcons} />
                                         <span>{applicationChoiceLabel(application, duplicates)}</span>
                                       </span>
+                                      <AppSideMeter application={application} />
                                     </label>
                                   );
                                 })}

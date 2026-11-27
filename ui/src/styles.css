@@ -784,10 +784,52 @@ button:disabled {
 }
 .application-group-options .checkbox-row {
   display: grid;
-  grid-template-columns: auto minmax(0, 1fr);
+  grid-template-columns: auto minmax(0, 1fr) auto;
   align-items: center;
   gap: 0.5rem;
   overflow-wrap: anywhere;
+}
+.app-side-meter {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  width: 3.4rem;
+  flex-shrink: 0;
+  justify-content: flex-end;
+}
+.app-side-meter-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 999px;
+  background: var(--text-muted, #6f7785);
+  opacity: 0.45;
+  flex-shrink: 0;
+}
+.app-side-meter-dot[data-state="running"] {
+  background: #60a5fa;
+  opacity: 0.85;
+}
+.app-side-meter-dot[data-state="sounding"] {
+  background: #22c55e;
+  opacity: 1;
+}
+.app-side-meter-track {
+  width: 2.25rem;
+  height: 5px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.1);
+  overflow: hidden;
+  flex-shrink: 0;
+}
+.theme-light .app-side-meter-track {
+  background: rgba(23, 32, 51, 0.12);
+}
+.app-side-meter-fill {
+  display: block;
+  height: 100%;
+  border-radius: 999px;
+  background: linear-gradient(90deg, #22c55e, #f59e0b);
+  transition: width 120ms linear;
 }
 .app-exe-icon {
   width: 16px;

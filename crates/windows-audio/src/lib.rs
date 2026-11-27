@@ -28,6 +28,8 @@ mod packet_codec;
 pub use network_audio::*;
 pub use packet_codec::{decode_interleaved_float32, encode_interleaved_float32};
 mod drift;
+mod installed_apps;
+pub use installed_apps::{enumerate_installed_applications, InstalledApplicationInfo};
 #[cfg(all(test, windows))]
 mod drift_sim_tests;
 #[cfg(windows)]
@@ -278,7 +280,7 @@ pub struct NativeBridgeDriverInfo {
     pub capabilities: u32,
     pub supported_rates: u32,
     /// Configured minimum / default shared-mode period, frames at 48 kHz
-    /// (registry `MinPeriodFrames` / `DefaultPeriodFrames`, 17 Ã‚Â§5.5).
+    /// (registry `MinPeriodFrames` / `DefaultPeriodFrames`, 17 Ãƒâ€šÃ‚Â§5.5).
     pub min_period_frames: u32,
     pub default_period_frames: u32,
 }
@@ -393,7 +395,7 @@ struct NativeBridgeOpenRequest {
     bus_id: [u16; 64],
 }
 
-/// `AR_BRIDGE_OPEN_EXTENSION`: negotiates float64 samples (17 Ã‚Â§5.2).
+/// `AR_BRIDGE_OPEN_EXTENSION`: negotiates float64 samples (17 Ãƒâ€šÃ‚Â§5.2).
 #[cfg(windows)]
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
@@ -1425,7 +1427,7 @@ impl NativeBridgeController {
             return Err(NativeBridgeControllerError::Windows(error));
         }
         // The driver owns the lease from here; its HEARTBEAT result is the
-        // only liveness decision (a stalled owner may renew, spec 17 Ã‚Â§5).
+        // only liveness decision (a stalled owner may renew, spec 17 Ãƒâ€šÃ‚Â§5).
         let mut session = session;
         session.defer_lease_to_driver();
         Ok(Self {
@@ -1529,12 +1531,12 @@ impl NativeBridgeController {
             .map_err(NativeBridgeControllerError::Session)
     }
 
-    /// Driver-written stream counters for this lease (17 Ã‚Â§5.2).
+    /// Driver-written stream counters for this lease (17 Ãƒâ€šÃ‚Â§5.2).
     pub fn counters(&self) -> NativeBridgeStreamCounters {
         self.live().counters()
     }
 
-    /// Driver-written `SetWritePacket` outcomes for this lease (17 Ã‚Â§5.2).
+    /// Driver-written `SetWritePacket` outcomes for this lease (17 Ãƒâ€šÃ‚Â§5.2).
     pub fn packet_counters(&self) -> NativeBridgePacketCounters {
         self.live().packet_counters()
     }
@@ -3939,13 +3941,14 @@ pub struct ApplicationInfo {
 /// Read-only audio-session facts associated with a process. These facts are
 /// observed from Windows session managers; they are not a promise that a
 /// future process-loopback binding will succeed.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ApplicationAudioInfo {
     pub process_id: u32,
     pub active_session_count: u32,
     pub total_session_count: u32,
     pub capture_session_count: u32,
     pub render_session_count: u32,
+    pub peak_level: f32,
     pub display_names: Vec<String>,
     /// The endpoints this process has a session on. A loopback recorder of
     /// an endpoint also holds a render session there, so `Render` means
@@ -4458,7 +4461,7 @@ impl windows::Win32::Media::Audio::IActivateAudioInterfaceCompletionHandler_Impl
 /// channel layout and sample format, so a shared-mode stream initialized with
 /// `AUTOCONVERTPCM | SRC_DEFAULT_QUALITY` is resampled by the Windows audio
 /// engine. Returns whether the rate changed (and so needs the SRC flag).
-/// `None`, an unchanged rate, or a rate outside 8Ã¢â‚¬â€œ192 kHz leaves the format as is.
+/// `None`, an unchanged rate, or a rate outside 8ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Å“192 kHz leaves the format as is.
 ///
 /// # Safety
 /// `format` must point to a valid, writable `WAVEFORMATEX` (or the header of a
@@ -4672,7 +4675,7 @@ impl ProcessLoopbackCapture {
                     error,
                 })?;
         // The process-loopback virtual device does not expose a reliable
-        // endpoint mix format. MicrosoftÃ¢â‚¬â„¢s activation sample uses this
+        // endpoint mix format. MicrosoftÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢s activation sample uses this
         // caller-owned PCM shape and lets shared mode convert it.
         // The feeder consumes graph-rate frames directly. A 44.1 kHz
         // request here starves a 48 kHz Mixer even with silent app audio.
@@ -8738,6 +8741,7 @@ pub fn enumerate_applications() -> Result<Vec<ApplicationInfo>, AudioError> {
 /// that every protected or future capture can be looped back.
 pub fn enumerate_application_audio() -> Result<Vec<ApplicationAudioInfo>, AudioError> {
     use std::collections::BTreeMap;
+    use windows::Win32::Media::Audio::Endpoints::IAudioMeterInformation;
     use windows::Win32::Media::Audio::{
         eCapture, eRender, AudioSessionStateActive, IAudioSessionControl2, IAudioSessionManager2,
         IMMDeviceEnumerator, MMDeviceEnumerator, DEVICE_STATE_ACTIVE,
@@ -8796,6 +8800,13 @@ pub fn enumerate_application_audio() -> Result<Vec<ApplicationAudioInfo>, AudioE
                         let state = session
                             .GetState()
                             .unwrap_or(windows::Win32::Media::Audio::AudioSessionStateInactive);
+                        let session_peak = session
+                            .cast::<IAudioMeterInformation>()
+                            .ok()
+                            .and_then(|meter| meter.GetPeakValue().ok())
+                            .filter(|v| v.is_finite())
+                            .map(|v| v.clamp(0.0, 1.0))
+                            .unwrap_or(0.0);
                         let entry =
                             by_process
                                 .entry(process_id)
@@ -8805,10 +8816,14 @@ pub fn enumerate_application_audio() -> Result<Vec<ApplicationAudioInfo>, AudioE
                                     total_session_count: 0,
                                     capture_session_count: 0,
                                     render_session_count: 0,
+                                    peak_level: 0.0,
                                     display_names: Vec::new(),
                                     endpoints: Vec::new(),
                                 });
                         entry.total_session_count = entry.total_session_count.saturating_add(1);
+                        if session_peak > entry.peak_level {
+                            entry.peak_level = session_peak;
+                        }
                         if state == AudioSessionStateActive {
                             entry.active_session_count =
                                 entry.active_session_count.saturating_add(1);
@@ -9147,6 +9162,57 @@ pub fn resolve_application_group_roots(
         });
     }
     Ok(roots)
+}
+
+/// Same as [`resolve_application_group_roots`], except when Windows or an
+/// anti-cheat driver blocks `OpenProcess` (leaving `executable_path` and
+/// `creation_time_100ns` as `None`), processes matching `expected_executable`
+/// by image name are still returned so process-loopback activation can be
+/// attempted.
+pub fn resolve_application_group_roots_allowing_uninspected(
+    applications: &[ApplicationInfo],
+    expected_executable: &str,
+    expected_executable_path: Option<&str>,
+) -> Result<Vec<ApplicationInfo>, AudioError> {
+    match resolve_application_group_roots(
+        applications,
+        expected_executable,
+        expected_executable_path,
+    ) {
+        Ok(roots) => Ok(roots),
+        Err(AudioError::ApplicationRestartIdentityUnavailable { .. })
+            if expected_executable_path.is_some() =>
+        {
+            let name_matches = applications
+                .iter()
+                .filter(|application| {
+                    application
+                        .executable
+                        .eq_ignore_ascii_case(expected_executable)
+                        && application.executable_path.is_none()
+                })
+                .collect::<Vec<_>>();
+            let roots = name_matches
+                .iter()
+                .copied()
+                .filter(|candidate| {
+                    !name_matches.iter().any(|other| {
+                        other.process_id != candidate.process_id
+                            && is_process_ancestor(other, candidate, applications)
+                    })
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            if roots.is_empty() {
+                Err(AudioError::ApplicationRestartIdentityUnavailable {
+                    executable: expected_executable.to_owned(),
+                })
+            } else {
+                Ok(roots)
+            }
+        }
+        Err(error) => Err(error),
+    }
 }
 
 /// Resolve an application for preparation. The saved PID and creation time
@@ -9660,12 +9726,12 @@ const BRIDGE_SAMPLE_BYTES_FLOAT64: u32 = 8;
 /// `AR_BRIDGE_MAX_CHANNELS`: the kernel cable bridge carries up to 7.1. This
 /// is separate from the internal 2-channel AudioBridge protocol bound.
 pub const NATIVE_DRIVER_MAX_CHANNELS: u16 = 8;
-/// `AR_BRIDGE_MAX_PAYLOAD_BYTES`: 8 channels Ã— 4096 frames Ã— 8-byte samples.
+/// `AR_BRIDGE_MAX_PAYLOAD_BYTES`: 8 channels Ãƒâ€” 4096 frames Ãƒâ€” 8-byte samples.
 pub const NATIVE_DRIVER_MAX_PAYLOAD_BYTES: usize = NATIVE_DRIVER_MAX_CHANNELS as usize
     * audiorouter_protocol::MAX_AUDIO_BRIDGE_FRAMES as usize
     * std::mem::size_of::<f64>();
 
-/// Driver-written stream counters from the shared header (17 Â§5.2). User
+/// Driver-written stream counters from the shared header (17 Ã‚Â§5.2). User
 /// mode only reads them; all values are monotonic within one lease.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct NativeBridgeStreamCounters {
@@ -9679,7 +9745,7 @@ pub struct NativeBridgeStreamCounters {
 }
 
 /// Driver-written `SetWritePacket` outcomes for a render-source lease (17
-/// Â§5.2): how often Windows submitted a packet on time, late (already
+/// Ã‚Â§5.2): how often Windows submitted a packet on time, late (already
 /// transferring) or too far ahead. Zero on capture leases and older drivers.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct NativeBridgePacketCounters {
@@ -10388,7 +10454,7 @@ pub struct NativeBridgeSession {
     last_heartbeat: std::time::Instant,
     /// Set once the kernel accepted OPEN for this mapping. From then on the
     /// driver alone decides whether the lease is alive: its HEARTBEAT renews
-    /// an owner's expired lease that no rival reclaimed (spec 17 Â§5), and its
+    /// an owner's expired lease that no rival reclaimed (spec 17 Ã‚Â§5), and its
     /// clock ignores sleep. A local wall-clock deadline would end the route
     /// after any stall longer than `lease_ms` even though the driver kept it.
     driver_authoritative: bool,
@@ -12830,6 +12896,24 @@ mod tests {
     }
 
     #[test]
+    fn group_roots_allow_uninspected_protected_processes_when_open_process_is_denied() {
+        let protected_game = ApplicationInfo {
+            process_id: 9001,
+            parent_process_id: 100,
+            executable: "FC26.exe".into(),
+            executable_path: None,
+            creation_time_100ns: None,
+        };
+        let roots = resolve_application_group_roots_allowing_uninspected(
+            std::slice::from_ref(&protected_game),
+            "FC26.exe",
+            Some(r"D:\Games\Steam\steamapps\common\FC 26\FC26.exe"),
+        )
+        .unwrap();
+        assert_eq!(roots, vec![protected_game]);
+    }
+
+    #[test]
     fn restart_binding_collapses_same_image_process_tree_to_its_root() {
         let root = ApplicationInfo {
             process_id: 10,
@@ -13084,6 +13168,7 @@ mod tests {
                 total_session_count: 1,
                 capture_session_count: 0,
                 render_session_count: 1,
+                peak_level: 0.0,
                 display_names: vec!["zulu".into(), "alpha".into(), "alpha".into()],
                 endpoints: Vec::new(),
             },
@@ -13093,6 +13178,7 @@ mod tests {
                 total_session_count: 2,
                 capture_session_count: 1,
                 render_session_count: 1,
+                peak_level: 0.0,
                 display_names: vec!["voice".into()],
                 endpoints: vec![
                     ApplicationAudioEndpoint {

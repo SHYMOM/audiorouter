@@ -507,37 +507,70 @@ function applicationSelectorParameters(selector: ApplicationExecutableSelector) 
   };
 }
 
-/** Stable picker key for one exact process instance. */
+/** Stable picker key for one exact process instance or installed application. */
 export function applicationChoiceKey(application: ApplicationInfo): string {
+  if (application.processId === 0 || application.running === false) {
+    return `installed-${(application.executablePath ?? application.executable).toLowerCase()}`;
+  }
   return `${application.processId}-${application.creationTime100ns ?? "unknown"}`;
+}
+
+function isApplicationSounding(application: ApplicationInfo): boolean {
+  return (application.peakLevel ?? 0) > 0.001 || application.activeAudioSessionCount > 0;
+}
+
+function isApplicationRunning(application: ApplicationInfo): boolean {
+  return application.running !== false && application.processId > 0;
 }
 
 /**
  * Groups application-capture choices. Process loopback records what an
  * application plays, so a process without a current audio session is still a
- * valid source. Processes with audio sessions are listed individually; others
- * fold same-path helpers (Electron/Chromium trees) into their earliest instance.
+ * valid source, and installed apps can be pre-selected for App groups.
+ * Running apps producing sound are sorted first, then other running apps,
+ * then non-running installed apps at the bottom.
  */
 export function applicationCaptureChoices(applications: readonly ApplicationInfo[]): {
   withAudio: ApplicationInfo[];
   other: ApplicationInfo[];
 } {
-  const eligible = applications.filter((application) => application.executable && application.processId > 0);
+  const eligible = applications.filter(
+    (application) =>
+      Boolean(application.executable) && (isApplicationRunning(application) || Boolean(application.executablePath)),
+  );
   const byLabel = (left: ApplicationInfo, right: ApplicationInfo) =>
-    left.executable.localeCompare(right.executable, undefined, { sensitivity: "base" }) ||
-    left.processId - right.processId;
+    (left.displayName ?? left.executable).localeCompare(right.displayName ?? right.executable, undefined, {
+      sensitivity: "base",
+    }) || left.processId - right.processId;
   const pathKey = (application: ApplicationInfo) =>
     (application.executablePath ?? application.executable).toLowerCase();
-  const audioPaths = new Set(eligible.filter((application) => application.audioSessionCount > 0).map(pathKey));
-  // Prefer the process with active/observed audio sessions (e.g. a game's
-  // audio process rather than its earlier idle launcher process), falling back
-  // to earliest creation time.
+  const audioPaths = new Set(
+    eligible
+      .filter(
+        (application) =>
+          isApplicationRunning(application) &&
+          (application.audioSessionCount > 0 || (application.peakLevel ?? 0) > 0.001),
+      )
+      .map(pathKey),
+  );
+  // Prefer running over installed, then sounding/active audio sessions, then
+  // observed sessions, falling back to earliest creation time.
   const preferred = new Map<string, ApplicationInfo>();
   for (const application of eligible) {
     const key = pathKey(application);
     const current = preferred.get(key);
     if (!current) {
       preferred.set(key, application);
+      continue;
+    }
+    const runningDiff = Number(isApplicationRunning(application)) - Number(isApplicationRunning(current));
+    if (runningDiff !== 0) {
+      if (runningDiff > 0) preferred.set(key, application);
+      continue;
+    }
+    const peakDiff = (application.peakLevel ?? 0) - (current.peakLevel ?? 0);
+    if (Math.abs(peakDiff) > 0.001) {
+      if (peakDiff > 0) preferred.set(key, application);
       continue;
     }
     const activeDiff = application.activeAudioSessionCount - current.activeAudioSessionCount;
@@ -562,12 +595,19 @@ export function applicationCaptureChoices(applications: readonly ApplicationInfo
       p.includes("\\windows\\systemapps\\")
     );
   };
-  const byUserFirst = (left: ApplicationInfo, right: ApplicationInfo) =>
-    Number(isWindowsSystem(left)) - Number(isWindowsSystem(right)) || byLabel(left, right);
-  const roots = [...preferred.values()].sort(byLabel);
+  const bySoundingFirst = (left: ApplicationInfo, right: ApplicationInfo) =>
+    Number(isApplicationSounding(right)) - Number(isApplicationSounding(left)) ||
+    (right.peakLevel ?? 0) - (left.peakLevel ?? 0) ||
+    right.activeAudioSessionCount - left.activeAudioSessionCount ||
+    byLabel(left, right);
+  const byRunningThenInstalled = (left: ApplicationInfo, right: ApplicationInfo) =>
+    Number(isApplicationRunning(right)) - Number(isApplicationRunning(left)) ||
+    Number(isWindowsSystem(left)) - Number(isWindowsSystem(right)) ||
+    byLabel(left, right);
+  const roots = [...preferred.values()];
   return {
-    withAudio: roots.filter((application) => audioPaths.has(pathKey(application))),
-    other: roots.filter((application) => !audioPaths.has(pathKey(application))).sort(byUserFirst),
+    withAudio: roots.filter((application) => audioPaths.has(pathKey(application))).sort(bySoundingFirst),
+    other: roots.filter((application) => !audioPaths.has(pathKey(application))).sort(byRunningThenInstalled),
   };
 }
 

@@ -698,6 +698,8 @@ export function MixerInputsEditor({
 }
 
 export function applicationBaseLabel(application: ApplicationRow): string {
+  const topName = application.displayName?.trim();
+  if (topName && !topName.startsWith("{")) return topName;
   const display = application.audioDisplayNames.find((name) => name.trim() && !name.trim().startsWith("{"));
   if (display) return display.trim();
   return application.executable.replace(/\.exe$/i, "");
@@ -719,14 +721,35 @@ export function duplicateApplicationLabels(applications: readonly ApplicationRow
 export function applicationChoiceLabel(application: ApplicationRow, duplicates?: ReadonlySet<string>): string {
   const name = applicationBaseLabel(application);
   if (duplicates?.has(name.toLowerCase())) {
+    if (application.running === false || application.processId === 0) {
+      return `${name} (${application.executable})`;
+    }
     return `${name} (PID ${application.processId})`;
   }
   return name;
 }
 
+export function AppSideMeter({ application }: { application: ApplicationRow }) {
+  const running = application.running !== false && application.processId > 0;
+  const peak = running ? Math.min(1, Math.max(0, application.peakLevel ?? 0)) : 0;
+  const sounding = running && (peak > 0.001 || application.activeAudioSessionCount > 0);
+  const state = sounding ? "sounding" : running ? "running" : "stopped";
+  const label = sounding ? "Producing sound" : running ? "Running" : "Installed (not running)";
+  const barPercent = sounding ? Math.max(12, Math.round(peak * 100)) : 0;
+  return (
+    <span className="app-side-meter" title={label} aria-label={label}>
+      <span className="app-side-meter-dot" data-state={state} />
+      <span className="app-side-meter-track">
+        <span className="app-side-meter-fill" style={{ width: `${barPercent}%` }} />
+      </span>
+    </span>
+  );
+}
+
 export function ApplicationChoiceOptions({ applications }: { applications: ApplicationRow[] }) {
   const tr = useMessages();
-  const { withAudio, other } = applicationCaptureChoices(applications);
+  const runningOnly = applications.filter((application) => application.running !== false && application.processId > 0);
+  const { withAudio, other } = applicationCaptureChoices(runningOnly);
   const duplicates = duplicateApplicationLabels([...withAudio, ...other]);
   return (
     <>
@@ -836,6 +859,14 @@ export function ApplicationGroupEditor({
   const [executablePath, setExecutablePath] = useState("");
   const [editorMessage, setEditorMessage] = useState("");
 
+  useEffect(() => {
+    if (disabled) return;
+    const timer = window.setInterval(() => {
+      onRefresh();
+    }, 650);
+    return () => window.clearInterval(timer);
+  }, [disabled, onRefresh]);
+
   const entryKey = (entry: ApplicationGroupEntry) => (entry.executablePath ?? entry.executable).toLowerCase();
   const existingKeys = new Set(entries.map(entryKey));
   const availableToAdd = capturable.filter((application) => {
@@ -930,17 +961,17 @@ export function ApplicationGroupEditor({
       {availableToAdd.length > 0 && (
         <>
           <label>
-            Search running applications
+            Search applications and games
             <input
               type="search"
               value={searchQuery}
-              placeholder="Filter by app name (e.g. BloodStrike, Discord)..."
+              placeholder="Filter by app or game name (e.g. BloodStrike, FC 26, Discord)..."
               disabled={disabled}
               onChange={(event) => setSearchQuery(event.target.value)}
             />
           </label>
           <fieldset className="application-group-options" disabled={disabled}>
-            <legend>Add running applications</legend>
+            <legend>Add applications and games</legend>
             {filteredToAdd.map((application) => {
               const key = applicationChoiceKey(application);
               return (
@@ -958,6 +989,7 @@ export function ApplicationGroupEditor({
                     <AppExeIcon executablePath={application.executablePath} icons={icons} />
                     <span>{applicationChoiceLabel(application, duplicates)}</span>
                   </span>
+                  <AppSideMeter application={application} />
                 </label>
               );
             })}

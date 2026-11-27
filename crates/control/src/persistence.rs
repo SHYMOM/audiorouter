@@ -361,6 +361,8 @@ impl ControlPlane {
             #[cfg(windows)]
             multi_input_application_sources: Vec::new(),
             #[cfg(windows)]
+            multi_input_application_groups: Vec::new(),
+            #[cfg(windows)]
             native_multi_input_device_channels: Vec::new(),
             network_log: network_log::Sampler::default(),
             siege_round_feed: Default::default(),

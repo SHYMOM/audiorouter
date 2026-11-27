@@ -592,6 +592,8 @@ pub struct ControlPlane {
     native_multi_input_applied_generation: Option<u64>,
     #[cfg(windows)]
     multi_input_application_sources: Vec<MultiInputApplicationSource>,
+    #[cfg(windows)]
+    multi_input_application_groups: Vec<MultiInputApplicationGroupSource>,
     /// Device nodes whose port channel count differs from the mono or
     /// stereo endpoint the prepared multi-input worker reads, with that
     /// endpoint's channel count (see `native_paths_session`).
@@ -767,6 +769,8 @@ impl ControlPlane {
             native_multi_input_applied_generation: None,
             #[cfg(windows)]
             multi_input_application_sources: Vec::new(),
+            #[cfg(windows)]
+            multi_input_application_groups: Vec::new(),
             #[cfg(windows)]
             native_multi_input_device_channels: Vec::new(),
             network_log: network_log::Sampler::default(),

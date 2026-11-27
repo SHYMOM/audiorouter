@@ -387,6 +387,8 @@ impl ControlPlane {
             self.native_multi_input_applied_generation = None;
             #[cfg(windows)]
             self.multi_input_application_sources.clear();
+            #[cfg(windows)]
+            self.multi_input_application_groups.clear();
         }
         for session_id in &crashed_session_ids {
             self.deactivate_virtual_route_bridges(session_id);

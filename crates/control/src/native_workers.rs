@@ -300,6 +300,8 @@ impl ControlPlane {
         self.native_multi_input_applied_generation = None;
         #[cfg(windows)]
         self.multi_input_application_sources.clear();
+        #[cfg(windows)]
+        self.multi_input_application_groups.clear();
         Ok(())
     }
 

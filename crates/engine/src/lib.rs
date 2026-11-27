@@ -8516,13 +8516,20 @@ pub fn compile_native_paths_with_plugins_and_audio(
     let mut paths = Vec::with_capacity(components.len());
     for (index, component) in components.iter().enumerate() {
         let unsupported = || {
+            let start_name = component
+                .nodes
+                .iter()
+                .find(|node| {
+                    !component
+                        .edges
+                        .iter()
+                        .any(|edge| edge.enabled && edge.destination_node == node.id)
+                })
+                .or_else(|| component.nodes.first())
+                .map_or("", |node| node.name.as_str());
             GraphCompileError::UnsupportedPath(format!(
-                "path {} (starting at \"{}\")",
+                "path {} (starting at \"{start_name}\")",
                 index + 1,
-                component
-                    .nodes
-                    .first()
-                    .map_or("", |node| node.name.as_str())
             ))
         };
         let convergence_count = component
@@ -8575,11 +8582,19 @@ pub fn compile_native_paths_with_plugins_and_audio(
             }
             _ => return Err(unsupported()),
         };
-        let graph = compile_path_graph(component, convergence, generation, plugins, audio_media)
-            .map_err(|error| match error {
-                GraphCompileError::UnsupportedTopology => unsupported(),
-                other => other,
-            })?;
+        let graph =
+            match compile_path_graph(component, convergence, generation, plugins, audio_media) {
+                Ok(graph) => graph,
+                Err(GraphCompileError::UnsupportedTopology) => {
+                    connected_mixers::compile(component, generation, plugins, audio_media).map_err(
+                        |error| match error {
+                            GraphCompileError::UnsupportedTopology => unsupported(),
+                            other => other,
+                        },
+                    )?
+                }
+                Err(other) => return Err(other),
+            };
         paths.push(graph);
     }
     let input_count = paths
@@ -12253,6 +12268,36 @@ mod tests {
                     "one block per branch"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn single_mixer_with_pre_mixer_output_fanout_and_dead_end_meter_compiles() {
+        let mut session = pre_mixer_branch_session();
+        let mut meter = session
+            .nodes
+            .iter()
+            .find(|node| node.id.as_str() == "game-eq")
+            .unwrap()
+            .clone();
+        meter.id = audiorouter_domain::EntityId::new("dead-meter");
+        meter.name = "Dead Meter".into();
+        meter.kind = audiorouter_domain::NodeKind::Meter;
+        meter.parameters = Default::default();
+        session.nodes.push(meter);
+        let mut edge = session.edges[0].clone();
+        edge.id = audiorouter_domain::EntityId::new("e-meter");
+        edge.source_node = audiorouter_domain::EntityId::new("game-eq");
+        edge.destination_node = audiorouter_domain::EntityId::new("dead-meter");
+        edge.matrix = vec![1.0, 0.0, 0.0, 1.0];
+        session.edges.push(edge);
+        if let Err(err) = compile_native_paths_with_plugins_and_audio(
+            &session,
+            RuntimeGeneration::new(1),
+            &Default::default(),
+            &Default::default(),
+        ) {
+            panic!("unexpected compile error: {err:?}");
         }
     }
 

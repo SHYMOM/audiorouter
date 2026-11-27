@@ -38,6 +38,120 @@ pub(crate) struct MultiInputApplicationSource {
     pub(crate) retry_delay: Duration,
 }
 
+#[cfg(windows)]
+#[derive(Clone)]
+pub(crate) struct MultiInputApplicationGroupMember {
+    pub(crate) executable: String,
+    pub(crate) executable_path: Option<String>,
+}
+
+/// Restart and new-process tracking for an Application Group node feeding the
+/// native multi-input Mixer. Closed apps stay silent until launched, and newly
+/// spawned root processes (such as a launcher starting a game) hot-swap in.
+#[cfg(windows)]
+pub(crate) struct MultiInputApplicationGroupSource {
+    pub(crate) session_id: EntityId,
+    pub(crate) node_id: EntityId,
+    pub(crate) input_index: usize,
+    pub(crate) members: Vec<MultiInputApplicationGroupMember>,
+    pub(crate) bound_pids: Vec<u32>,
+    pub(crate) state: &'static str,
+    pub(crate) detail: &'static str,
+    pub(crate) next_probe_at: Instant,
+    pub(crate) retry_delay: Duration,
+}
+
+#[cfg(windows)]
+pub(crate) fn resolve_application_group_pids(
+    running: &[audiorouter_windows_audio::ApplicationInfo],
+    members: &[MultiInputApplicationGroupMember],
+) -> Vec<u32> {
+    let mut pids = Vec::new();
+    for member in members {
+        if let Ok(roots) =
+            audiorouter_windows_audio::resolve_application_group_roots_allowing_uninspected(
+                running,
+                &member.executable,
+                member.executable_path.as_deref(),
+            )
+        {
+            for app in roots {
+                if !pids.contains(&app.process_id) {
+                    pids.push(app.process_id);
+                }
+            }
+        }
+    }
+    pids.sort_unstable();
+    pids
+}
+
+#[cfg(windows)]
+pub(crate) fn build_application_group_capture(
+    pids: &[u32],
+) -> (
+    audiorouter_windows_audio::MultiInputCaptureSource,
+    Vec<u32>,
+    &'static str,
+    &'static str,
+) {
+    let mut captures = Vec::new();
+    let mut bound_pids = Vec::new();
+    let mut had_access_error = false;
+    for &pid in pids {
+        match audiorouter_windows_audio::ProcessLoopbackCapture::open(
+            pid,
+            audiorouter_windows_audio::ProcessLoopbackMode::IncludeTargetTree,
+        ) {
+            Ok(capture) => {
+                captures.push(
+                    audiorouter_windows_audio::MultiInputCaptureSource::ApplicationLoopback(
+                        capture,
+                    ),
+                );
+                bound_pids.push(pid);
+            }
+            Err(_) => {
+                had_access_error = true;
+            }
+        }
+    }
+    let (state, detail) = if !bound_pids.is_empty() {
+        (
+            "connected",
+            "Connected to running group applications. Audio flow appears when an app produces sound.",
+        )
+    } else if had_access_error {
+        captures.push(audiorouter_windows_audio::MultiInputCaptureSource::Silence(
+            audiorouter_windows_audio::SilentCapture::new(
+                audiorouter_engine::PROCESSING_QUANTUM_FRAMES,
+            ),
+        ));
+        (
+            "failed",
+            "Windows blocked loopback capture for a running app in this group. AudioRouter will retry.",
+        )
+    } else {
+        captures.push(audiorouter_windows_audio::MultiInputCaptureSource::Silence(
+            audiorouter_windows_audio::SilentCapture::new(
+                audiorouter_engine::PROCESSING_QUANTUM_FRAMES,
+            ),
+        ));
+        (
+            "app-closed",
+            "Applications in this group are closed. AudioRouter reconnects automatically when they start.",
+        )
+    };
+    (
+        audiorouter_windows_audio::MultiInputCaptureSource::ApplicationGroup(
+            audiorouter_windows_audio::ApplicationGroupCapture::new(captures),
+        ),
+        bound_pids,
+        state,
+        detail,
+    )
+}
+
 #[derive(Clone)]
 pub(crate) struct ApplicationCaptureRuntime {
     pub(crate) session_id: EntityId,
@@ -259,6 +373,20 @@ impl ControlPlane {
             states.push(json!({
                 "sessionId": source.session_id,
                 "nodeId": source.node_id,
+                "state": state,
+                "detail": detail,
+            }));
+        }
+        #[cfg(windows)]
+        for group in &self.multi_input_application_groups {
+            let (state, detail) = if running(&group.session_id) {
+                (group.state, group.detail)
+            } else {
+                stopped
+            };
+            states.push(json!({
+                "sessionId": group.session_id,
+                "nodeId": group.node_id,
                 "state": state,
                 "detail": detail,
             }));
@@ -598,12 +726,19 @@ impl ControlPlane {
         let due = |source: &MultiInputApplicationSource| {
             &source.session_id == session_id && (force || source.next_probe_at <= now)
         };
-        if !self.multi_input_application_sources.iter().any(due) {
+        let group_due = |group: &MultiInputApplicationGroupSource| {
+            &group.session_id == session_id && (force || group.next_probe_at <= now)
+        };
+        if !self.multi_input_application_sources.iter().any(due)
+            && !self.multi_input_application_groups.iter().any(group_due)
+        {
             return false;
         }
         // Routine liveness must not enumerate every process on the thread
-        // that services WASAPI. Scan only when a bound source needs recovery.
+        // that services WASAPI. Scan only when a bound source needs recovery or
+        // an application group is due for a root-PID check.
         let all_current = !force
+            && !self.multi_input_application_groups.iter().any(group_due)
             && self
                 .multi_input_application_sources
                 .iter()
@@ -810,6 +945,45 @@ impl ControlPlane {
                             (delay * 2).min(APPLICATION_CAPTURE_RETRY_MAX);
                     }
                 }
+            }
+        }
+        for index in 0..self.multi_input_application_groups.len() {
+            if !group_due(&self.multi_input_application_groups[index]) {
+                continue;
+            }
+            let (input_index, members, bound_pids) = {
+                let group = &self.multi_input_application_groups[index];
+                (
+                    group.input_index,
+                    group.members.clone(),
+                    group.bound_pids.clone(),
+                )
+            };
+            let target_pids = resolve_application_group_pids(&applications, &members);
+            if target_pids == bound_pids {
+                let group = &mut self.multi_input_application_groups[index];
+                group.next_probe_at = now + APPLICATION_CAPTURE_LIVENESS_POLL;
+                continue;
+            }
+            let (capture, new_bound_pids, state, detail) =
+                build_application_group_capture(&target_pids);
+            let replaced = self
+                .native_multi_input_worker
+                .as_mut()
+                .is_some_and(|worker| worker.replace_capture(input_index, capture).is_ok());
+            if replaced {
+                changed = true;
+                let group = &mut self.multi_input_application_groups[index];
+                group.bound_pids = new_bound_pids;
+                group.state = state;
+                group.detail = detail;
+                group.retry_delay = APPLICATION_CAPTURE_RETRY_MIN;
+                group.next_probe_at = now + APPLICATION_CAPTURE_LIVENESS_POLL;
+            } else {
+                let group = &mut self.multi_input_application_groups[index];
+                let delay = group.retry_delay;
+                group.next_probe_at = now + delay;
+                group.retry_delay = (delay * 2).min(APPLICATION_CAPTURE_RETRY_MAX);
             }
         }
         changed

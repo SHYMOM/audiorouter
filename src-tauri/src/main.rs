@@ -1451,10 +1451,15 @@ fn extract_exe_icon_data_url(path: &str) -> Option<String> {
         CreateCompatibleDC, DeleteDC, DeleteObject, GetDIBits, BITMAPINFO, BITMAPINFOHEADER,
         BI_RGB, DIB_RGB_COLORS,
     };
-    use windows::Win32::UI::Shell::{SHGetFileInfoW, SHFILEINFOW, SHGFI_ICON, SHGFI_SMALLICON};
-    use windows::Win32::UI::WindowsAndMessaging::{DestroyIcon, GetIconInfo, ICONINFO};
+    use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED};
+    use windows::Win32::UI::Shell::{
+        ExtractIconExW, SHGetFileInfoW, SHFILEINFOW, SHGFI_ICON, SHGFI_SMALLICON,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::{DestroyIcon, GetIconInfo, HICON, ICONINFO};
 
     const SIZE: i32 = 16;
+    // SAFETY: COM is initialized for this thread and uninitialized before returning.
+    let coinit = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
     let wide: Vec<u16> = OsStr::new(path).encode_wide().chain(Some(0)).collect();
     let mut shfi = SHFILEINFOW::default();
     // SAFETY: `wide` is null-terminated and lives for the call; `shfi` is zero-initialized.
@@ -1467,17 +1472,32 @@ fn extract_exe_icon_data_url(path: &str) -> Option<String> {
             SHGFI_ICON | SHGFI_SMALLICON,
         )
     };
-    if ok == 0 || shfi.hIcon.is_invalid() {
-        return None;
-    }
-    let hicon = shfi.hIcon;
+    let hicon = if ok != 0 && !shfi.hIcon.is_invalid() {
+        shfi.hIcon
+    } else {
+        let mut small_icon = HICON::default();
+        // SAFETY: `wide` is null-terminated and `small_icon` is a live out pointer.
+        let extracted = unsafe {
+            ExtractIconExW(PCWSTR(wide.as_ptr()), 0, None, Some(&mut small_icon), 1)
+        };
+        if extracted == 0 || small_icon.is_invalid() {
+            if coinit.is_ok() {
+                unsafe { CoUninitialize() };
+            }
+            return None;
+        }
+        small_icon
+    };
     let mut icon_info = ICONINFO::default();
     // SAFETY: `hicon` is a valid icon handle owned by us and destroyed before returning.
     let got_info = unsafe { GetIconInfo(hicon, &mut icon_info) }.is_ok();
     if !got_info {
-        // SAFETY: `hicon` was returned by SHGetFileInfoW above.
+        // SAFETY: `hicon` was returned by SHGetFileInfoW or ExtractIconExW above.
         unsafe {
             let _ = DestroyIcon(hicon);
+            if coinit.is_ok() {
+                CoUninitialize();
+            }
         }
         return None;
     }
@@ -1522,6 +1542,9 @@ fn extract_exe_icon_data_url(path: &str) -> Option<String> {
             let _ = DeleteObject(icon_info.hbmMask.into());
         }
         let _ = DestroyIcon(hicon);
+        if coinit.is_ok() {
+            CoUninitialize();
+        }
         lines
     };
 

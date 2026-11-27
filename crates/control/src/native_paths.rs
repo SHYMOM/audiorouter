@@ -573,6 +573,7 @@ impl ControlPlane {
         }
         let mut capture_clients = Vec::with_capacity(bindings.len());
         let mut application_sources = Vec::new();
+        let mut application_groups = Vec::new();
         for (binding, binaural) in bindings
             .iter()
             .copied()
@@ -732,42 +733,14 @@ impl ControlPlane {
                         else {
                             continue;
                         };
-                        let executable_path = entry.get("executablePath").and_then(Value::as_str);
-                        match audiorouter_windows_audio::resolve_application_group_roots(
-                            &running,
-                            executable,
+                        let executable_path = entry
+                            .get("executablePath")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned);
+                        members.push(MultiInputApplicationGroupMember {
+                            executable: executable.to_owned(),
                             executable_path,
-                        ) {
-                            Ok(matched_roots) => {
-                                for application in matched_roots {
-                                    let capture =
-                                        audiorouter_windows_audio::ProcessLoopbackCapture::open(
-                                            application.process_id,
-                                            audiorouter_windows_audio::ProcessLoopbackMode::IncludeTargetTree,
-                                        )
-                                        .map_err(audio_control_error)?;
-                                    members.push(
-                                        audiorouter_windows_audio::MultiInputCaptureSource::ApplicationLoopback(
-                                            capture,
-                                        ),
-                                    );
-                                }
-                            }
-                            Err(
-                                audiorouter_windows_audio::AudioError::ApplicationRestartNotFound {
-                                    ..
-                                },
-                            ) => {
-                                members.push(
-                                    audiorouter_windows_audio::MultiInputCaptureSource::Silence(
-                                        audiorouter_windows_audio::SilentCapture::new(
-                                            audiorouter_engine::PROCESSING_QUANTUM_FRAMES,
-                                        ),
-                                    ),
-                                );
-                            }
-                            Err(error) => return Err(audio_control_error(error)),
-                        }
+                        });
                     }
                     if members.is_empty() {
                         return Err(ControlError::InvalidRequest(format!(
@@ -775,11 +748,21 @@ impl ControlPlane {
                             group_node.name
                         )));
                     }
-                    capture_clients.push(
-                        audiorouter_windows_audio::MultiInputCaptureSource::ApplicationGroup(
-                            audiorouter_windows_audio::ApplicationGroupCapture::new(members),
-                        ),
-                    );
+                    let target_pids = resolve_application_group_pids(&running, &members);
+                    let (capture, bound_pids, state, detail) =
+                        build_application_group_capture(&target_pids);
+                    application_groups.push(MultiInputApplicationGroupSource {
+                        session_id: session_id.clone(),
+                        node_id: source_node_ids[capture_clients.len()].clone(),
+                        input_index: capture_clients.len(),
+                        members,
+                        bound_pids,
+                        state,
+                        detail,
+                        next_probe_at: Instant::now() + APPLICATION_CAPTURE_RETRY_MIN,
+                        retry_delay: APPLICATION_CAPTURE_RETRY_MIN,
+                    });
+                    capture_clients.push(capture);
                 }
             }
         }
@@ -806,6 +789,7 @@ impl ControlPlane {
         self.live_graph_stale.remove(&session_id);
         self.live_publication_warnings.remove(&session_id);
         self.multi_input_application_sources = application_sources;
+        self.multi_input_application_groups = application_groups;
         self.register_multi_input_generators(&session_id);
         self.pending_endpoint_changes.clear();
         Ok(json!({

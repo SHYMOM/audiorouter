@@ -457,7 +457,11 @@ impl ControlPlane {
                 if self
                     .multi_input_application_sources
                     .iter()
-                    .any(|source| &source.session_id == session_id) =>
+                    .any(|source| &source.session_id == session_id)
+                    || self
+                        .multi_input_application_groups
+                        .iter()
+                        .any(|group| &group.session_id == session_id) =>
             {
                 // A closed application can fail its capture before the next
                 // one-second probe. Check now: if an input was switched to

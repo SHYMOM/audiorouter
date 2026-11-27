@@ -601,6 +601,31 @@ describe("application capture identity", () => {
     expect(applicationCaptureChoices([voice, media, root])).toEqual({ withAudio: [media], other: [] });
   });
 
+  it("sorts sounding apps first, then running apps, then non-running installed apps", () => {
+    const installedGame = {
+      ...app(0, "FC26.exe", "D:\\Games\\Steam\\steamapps\\common\\FC 26\\FC26.exe", "0", 0),
+      creationTime100ns: null,
+      running: false,
+      displayName: "EA SPORTS FC 26",
+      source: "steam" as const,
+      peakLevel: 0,
+    };
+    const runningQuiet = { ...app(12, "notepad.exe", "C:\\Windows\\notepad.exe", "10", 0), peakLevel: 0 };
+    const runningAudioIdle = {
+      ...app(15, "aaa.exe", "C:\\Apps\\aaa.exe", "20", 1),
+      activeAudioSessionCount: 0,
+      peakLevel: 0,
+    };
+    const runningSounding = {
+      ...app(18, "zzz.exe", "C:\\Apps\\zzz.exe", "30", 1),
+      activeAudioSessionCount: 1,
+      peakLevel: 0.42,
+    };
+    const choices = applicationCaptureChoices([installedGame, runningQuiet, runningAudioIdle, runningSounding]);
+    expect(choices.withAudio.map((item) => item.executable)).toEqual(["zzz.exe", "aaa.exe"]);
+    expect(choices.other.map((item) => item.executable)).toEqual(["notepad.exe", "FC26.exe"]);
+  });
+
   it("identifies a route whose only enabled source is one bound application", () => {
     const withApp = appendApplicationCaptureNode(
       {

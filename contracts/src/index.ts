@@ -1310,6 +1310,10 @@ export interface ApplicationInfo {
   executable: string;
   executablePath: string | null;
   creationTime100ns: string | null;
+  running?: boolean;
+  displayName?: string | null;
+  source?: "running" | "steam" | "epic" | "installed";
+  peakLevel?: number;
   audioActivity: "active" | "inactive" | "none";
   captureCapability: "observed" | "notObserved";
   audioSessionCount: number;
